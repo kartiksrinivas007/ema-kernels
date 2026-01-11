@@ -166,8 +166,8 @@ class TestEmaCumsumKernels:
 
         # Compare dstates: flatten Mamba's (head, dim) and match EMA
         new_mamba_dstates_flat = rearrange(new_mamba_dstates, "b c h p -> b c (h p)")
-        assert torch.allclose(new_ema_dstates, new_mamba_dstates_flat, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(new_ema_dstates, new_mamba_dstates_flat, atol=1e-3, rtol=1e-3)
 
         # Compare dA gradients: EMA aggregates over all heads, so sum Mamba's ddA over heads
         ddA_mamba_agg = ddA_mamba.sum(dim=1)  # shape: (batch, nchunks)
-        assert torch.allclose(ddA_ema, ddA_mamba_agg, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(ddA_ema, ddA_mamba_agg, atol=1e-4, rtol=1e-4)

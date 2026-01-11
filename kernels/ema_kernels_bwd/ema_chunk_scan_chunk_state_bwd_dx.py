@@ -186,7 +186,7 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        acc += tl.dot(W, dout_blk)
+        acc += tl.dot(W, dout_blk, input_precision="ieee")
 
         dA_cs_k_ptrs += BLOCK_SIZE_K * stride_dA_cs_csize
         dout_ptrs += BLOCK_SIZE_K * stride_dout_seqlen

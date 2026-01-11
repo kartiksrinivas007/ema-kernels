@@ -96,7 +96,7 @@ class TestEmaChunkStateBwdDb:
         )
 
 
-        assert torch.allclose(ddA_kernel, expected, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(ddA_kernel, expected, atol=1e-4, rtol=1e-4)
     
     
     def test_grad_matches_autograd_dA(self):
@@ -128,4 +128,4 @@ class TestEmaChunkStateBwdDb:
 
         # No shift adjustment needed
         expected = dA
-        assert torch.allclose(ddA_kernel, expected, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(ddA_kernel, expected, atol=1e-4, rtol=1e-4)

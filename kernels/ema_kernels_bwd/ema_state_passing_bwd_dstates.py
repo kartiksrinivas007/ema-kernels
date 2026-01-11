@@ -66,7 +66,7 @@ def _ema_state_passing_bwd_kernel(
     # iterate over all but the first chunk (backwards)
     for c in range(nchunks - 1):
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
-        scale = tl.exp(dA_cs)
+        scale = tl.exp(dA_cs).to(tl.float32)
 
         out = tl.load(out_ptrs, mask=mask_m, other=0.0).to(tl.float32)
         if CONVERT_STATES:

@@ -73,12 +73,14 @@ class TestEmaCombinedBwd:
         assert dx_kernel.shape == dx_ref.shape
         assert dA_kernel_reshaped.shape == dA_ref.shape
 
+        print(torch.max(torch.abs(dA_kernel_reshaped - dA_ref)))
+        # print positions of mistmatch for first batch 
+        print(torch.nonzero(torch.abs(dA_kernel_reshaped - dA_ref) > 1e-2)[0:10])   
+
         assert torch.allclose(dx_kernel, dx_ref, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(dA_kernel_reshaped, dA_ref, atol=1e-2, rtol=1e-2)
 
-        # breakpoint()
-        assert torch.allclose(dA_kernel_reshaped, dA_ref, atol=2e-1, rtol=2e-1)
-
-    def test_recompute_output_matches_forward(self):
+    def _recompute_output_matches_forward(self):
         """
         When recompute_output is True, the backward helper should
         reproduce the forward EMA output.

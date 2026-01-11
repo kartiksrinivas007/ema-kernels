@@ -121,6 +121,8 @@ class TestEmaCumsumKernels:
         # EMA dstates kernel should reproduce torch_dstates
         ema_dstates = _ema_chunk_scan_bwd_dstates(ema_cs, self.ema_dout)
 
-        assert torch.allclose(mamba_cs[:, 0, ...], ema_cs, atol=1e-2)
-        assert torch.allclose(ema_dstates, torch_dstates, atol=1e-2, rtol=1e-2)
-        assert torch.allclose(mamba_dstates.reshape(self.BATCH_SIZE, self.NUM_CHUNKS, -1), ema_dstates, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(mamba_cs[:, 0, ...], ema_cs, atol=1e-4)
+        assert torch.allclose(ema_dstates, torch_dstates, atol=1e-4, rtol=1e-4)
+
+        print("Max abs diff mamba dstates vs ema dstates:", torch.max(torch.abs(mamba_dstates.reshape(self.BATCH_SIZE, self.NUM_CHUNKS, -1) - ema_dstates)).item())
+        assert torch.allclose(mamba_dstates.reshape(self.BATCH_SIZE, self.NUM_CHUNKS, -1), ema_dstates, atol=1e-4, rtol=1e-4)

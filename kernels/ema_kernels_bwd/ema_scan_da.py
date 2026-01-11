@@ -128,7 +128,7 @@ def _ema_chunk_scan_bwd_ddAcs_stable(x, dA_cumsum, dout):
             dout.stride(0), dout.stride(1), dout.stride(2),
             dA_cumsum.stride(0), dA_cumsum.stride(1), dA_cumsum.stride(2),
             ddA_cumsum.stride(0), ddA_cumsum.stride(1), ddA_cumsum.stride(2), ddA_cumsum.stride(3),
-            BLOCK_SIZE_K=16
+            BLOCK_SIZE_K=64
             # BLOCK_SIZE_K =  16
         )
     BLOCK_SIZE_M_actual = _ema_chunk_scan_bwd_ddAcs_stable_kernel.best_config.kwargs["BLOCK_SIZE_M"]

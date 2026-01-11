@@ -45,7 +45,7 @@ class TestEmaChunkScanBwddA:
         cls.B = 4
         cls.CHUNK = 128
         cls.T = 512
-        cls.SEQLEN = 256
+        cls.SEQLEN = 8192
         cls.NCHUNKS = (cls.SEQLEN + cls.CHUNK - 1) // cls.CHUNK
 
         torch.manual_seed(0)
@@ -106,9 +106,8 @@ class TestEmaChunkScanBwddA:
         dda_mamba = torch.sum(dda_mamba, dim=1)  # sum over heads
 
         print("\n Max abs diff ddA kernel vs torch autograd:", torch.max(torch.abs(ddA_kernel - dA)).item())
-        print("Max abs diff ddA mamba vs torch autograd:", torch.max(torch.abs(dda_mamba - dA)).item())
-        print("Max abs diff ddA kernel vs mamba:", torch.max(torch.abs(ddA_kernel - dda_mamba)).item())
-        breakpoint()
+        # print("Max abs diff ddA mamba vs torch autograd:", torch.max(torch.abs(dda_mamba - dA)).item())
+        # print("Max abs diff ddA kernel vs mamba:", torch.max(torch.abs(ddA_kernel - dda_mamba)).item())
 
-        assert torch.allclose(ddA_kernel, dA, atol=1e-2, rtol=1e-2) # type:ignore
+        assert torch.allclose(ddA_kernel, dA, atol=1e-4, rtol=1e-4) # type:ignore
 

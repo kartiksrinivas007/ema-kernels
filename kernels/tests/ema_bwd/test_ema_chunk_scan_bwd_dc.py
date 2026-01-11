@@ -58,7 +58,7 @@ class TestEmaChunkScanBwdDc:
 
         dscale = scale_var.grad
 
-        assert torch.allclose(ddA_kernel, dscale, atol=1e-2, rtol=1e-2) # type:ignore
+        assert torch.allclose(ddA_kernel, dscale, atol=1e-4, rtol=1e-4) # type:ignore
     
     
     def test_matches_raw_torch_reference(self):
@@ -82,4 +82,4 @@ class TestEmaChunkScanBwdDc:
 
         ddA_kernel = ddA_kernel.flip([-1]).cumsum(dim = -1).flip([-1])
 
-        assert torch.allclose(ddA_kernel, dA, atol=1e-2, rtol=1e-2) # type:ignore
+        assert torch.allclose(ddA_kernel, dA, atol=1e-4, rtol=1e-4) # type:ignore
