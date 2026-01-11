@@ -80,7 +80,7 @@ class TestEmaCombinedBwd:
         assert torch.allclose(dx_kernel, dx_ref, atol=1e-2, rtol=1e-2)
         assert torch.allclose(dA_kernel_reshaped, dA_ref, atol=1e-2, rtol=1e-2)
 
-    def _recompute_output_matches_forward(self):
+    def test_recompute_output_matches_forward(self):
         """
         When recompute_output is True, the backward helper should
         reproduce the forward EMA output.
@@ -107,6 +107,8 @@ class TestEmaCombinedBwd:
         _, _, ema_out_recompute = _ema_chunk_scan_combined_bwd(
             dout.detach(), X.detach(), A.detach(), self.CHUNK, recompute_output=True
         )
+
+        print(torch.max(torch.abs(ema_out_recompute - ema_out_ref)))
 
         assert torch.allclose(ema_out_recompute, ema_out_ref, atol=1e-2, rtol=1e-2)
     

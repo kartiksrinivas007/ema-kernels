@@ -106,9 +106,9 @@ def _ema_chunk_scan_bwd_ddAcs_stable_kernel(
         ddAcs_ptrs += BLOCK_SIZE_N * stride_ddA_cs_csize_n
 
     # Need to zero out the rest, since we'll be summing the rows together
-    # for start_n in range(hi, chunk_size, BLOCK_SIZE_N):
-    #     tl.store(ddAcs_ptrs + stride_ddA_cs_csize_n, tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32), mask=offs_n < chunk_size - start_n - 1)
-    #     ddAcs_ptrs += BLOCK_SIZE_N * stride_ddA_cs_csize_n
+    for start_n in range(hi, chunk_size, BLOCK_SIZE_N):
+        tl.store(ddAcs_ptrs + stride_ddA_cs_csize_n, tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32), mask=offs_n < chunk_size - start_n - 1)
+        ddAcs_ptrs += BLOCK_SIZE_N * stride_ddA_cs_csize_n
 
 def _ema_chunk_scan_bwd_ddAcs_stable(x, dA_cumsum, dout):
     batch, seqlen, token_dim = x.shape
