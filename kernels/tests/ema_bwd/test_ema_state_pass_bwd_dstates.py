@@ -46,6 +46,43 @@ def _get_gpu_specifications(DEVICE):
 
     return DEVICE, properties
 
+    
+def state_passing_fwd_torch(states, A_cs, num_chunks):
+    batch, nchunks, token_dim = states.shape
+    assert A_cs.shape == (batch, nchunks)
+    assert num_chunks == nchunks
+
+    acc = torch.zeros((batch, token_dim), device=states.device, dtype=states.dtype)
+    out = [acc]
+    for idx in range(nchunks):
+        scale = torch.exp(A_cs[:, idx])
+        acc = scale[:, None] * acc + states[:, idx]
+        if idx < nchunks - 1:
+            out.append(acc)
+    return torch.stack(out, dim=1)
+
+
+def ema_state_passing_bwd_torch(out, dA_chunk_cumsum, dout):
+    """Torch reference for EMA state-passing backward (dstates, ddA)."""
+    batch, nchunks, token_dim = out.shape
+    assert dA_chunk_cumsum.shape == (batch, nchunks)
+    assert dout.shape == out.shape
+
+    dstates = torch.zeros_like(dout)
+    ddA = torch.zeros((batch, nchunks), device=out.device, dtype=dA_chunk_cumsum.dtype)
+
+    out_f = out.to(torch.float32)
+    dout_f = dout.to(torch.float32)
+    g_next = torch.zeros((batch, token_dim), device=out.device, dtype=torch.float32)
+
+    for idx in range(nchunks - 1, 0, -1):
+        scale = torch.exp(dA_chunk_cumsum[:, idx].to(torch.float32))
+        ddA[:, idx] = (out_f[:, idx] * g_next).sum(dim=-1) * scale
+        g_next = scale[:, None] * g_next + dout_f[:, idx]
+        dstates[:, idx - 1] = g_next.to(dstates.dtype)
+
+    return dstates, ddA
+
 class TestEmaCumsumKernels:
     BATCH_SIZE = 4
     SEQLEN = 8192
@@ -132,6 +169,9 @@ class TestEmaCumsumKernels:
         # (batch, nchunks, chunk_size) -> take last position in each chunk
         dA_base = ema_cs[..., -1]
 
+ 
+
+
         # Mamba backward over chunks
         new_mamba_dstates, ddA_mamba, dinit_mamba, states_conv_mamba = _state_passing_bwd(  # type: ignore
             states_mamba,
@@ -163,11 +203,43 @@ class TestEmaCumsumKernels:
             states_dtype=states_ema.dtype,
             chunk_size=self.MAMBA_CHUNK_SIZE,
         )
+        
+        torch_dstates, torch_ddA = ema_state_passing_bwd_torch(
+            states_ema,
+            dA_base,
+            dout_ema,
+        )
+
+        states_for_grad = states_ema.detach().clone().requires_grad_(True)
+        dA_for_grad = dA_base.detach().clone().requires_grad_(True)
+        out_torch = state_passing_fwd_torch(states_for_grad, dA_for_grad, nchunks)
+        autograd_dstates, autograd_ddA = torch.autograd.grad(
+            out_torch,
+            (states_for_grad, dA_for_grad),
+            grad_outputs=dout_ema,
+        )
+
+        kernel_dstates_autograd, kernel_ddA_autograd, _ = _ema_state_passing_bwd(  # type: ignore
+            out_torch.detach(),
+            dA_base,
+            dout_ema,
+            dfinal_states=None,
+            seq_idx=None,
+            has_initial_states=False,
+            dstates_dtype=dout_ema.dtype,
+            states_dtype=out_torch.dtype,
+            chunk_size=self.MAMBA_CHUNK_SIZE,
+        )
+               
 
         # Compare dstates: flatten Mamba's (head, dim) and match EMA
         new_mamba_dstates_flat = rearrange(new_mamba_dstates, "b c h p -> b c (h p)")
-        assert torch.allclose(new_ema_dstates, new_mamba_dstates_flat, atol=1e-3, rtol=1e-3)
+        assert torch.allclose(new_ema_dstates, new_mamba_dstates_flat, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(new_ema_dstates, torch_dstates, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(kernel_dstates_autograd, autograd_dstates, atol=1e-4, rtol=1e-4)
 
         # Compare dA gradients: EMA aggregates over all heads, so sum Mamba's ddA over heads
         ddA_mamba_agg = ddA_mamba.sum(dim=1)  # shape: (batch, nchunks)
         assert torch.allclose(ddA_ema, ddA_mamba_agg, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(ddA_ema, torch_ddA, atol=1e-4, rtol=1e-4)
+        assert torch.allclose(kernel_ddA_autograd, autograd_ddA, atol=1e-4, rtol=1e-4)
