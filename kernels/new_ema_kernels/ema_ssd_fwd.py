@@ -206,7 +206,7 @@ def chunk_cumsum_triton(
 # -------------------------------------
 # OPTIMAL CONFIG float32:
 # -------------------------------------
-# best config selected: num_warps: 2, num_ctas: 1, num_stages: 3, maxnreg: 256;
+# best config selected: num_warps: 2, num_ctas: 1, num_stages: 2, maxnreg: 256;
 # @triton.autotune(
 #      configs=[
 #         triton.Config({}, num_stages=s, num_warps=w, maxnreg=r)
@@ -219,7 +219,7 @@ def chunk_cumsum_triton(
 @triton.autotune(
      configs=[
         triton.Config({}, num_stages=s, num_warps=w, maxnreg=r)
-        for s in [3]
+        for s in [2]
         for w in [2]
         for r in [256]
     ],
