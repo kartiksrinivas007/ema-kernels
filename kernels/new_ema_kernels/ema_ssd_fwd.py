@@ -525,102 +525,79 @@ def test_ema(
     out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
     out_ref = ema_torch_ref(einops.rearrange(X, "b s h d -> b s (h d)"), P)
 
-    breakpoint()
 
     print("\n=== Correctness ===")
     print(f"Triton vs Ref f32, max diff = {(out_triton - out_ref).abs().max().item():.6f}, mean diff = {(out_triton - out_ref).abs().mean().item():.6f}")
 
 
+    #############################################
+    # BENCHMARKING 
+    ############################################
 
-    # from triton.testing import do_bench, do_bench_cudagraph
-    # import time
+    from triton.testing import do_bench, do_bench_cudagraph
+    import time
 
-    # # Disable GC for more consistent benchmarking
-    # import gc
-    # gc.collect()
-    # gc.disable()
+    # Disable GC for more consistent benchmarking
+    import gc
+    gc.collect()
+    gc.disable()
 
-    # print("\n=== Benchmarking ===")
+    print("\n=== Benchmarking ===")
 
-    # # Calculate memory I/O (without states)
-    # dtype_size = c.element_size()  # bytes per element (2 for fp16/bf16)
-    # # Read: C, B, X
-    # num_bytes_read = (c.numel() + b.numel() + x.numel()) * dtype_size
-    # # Add z read if present
-    # if has_z:
-    #     num_bytes_read += z.numel() * dtype_size  # z has same dtype as x
-    # if has_rotary:
-    #     num_bytes_read += angles.numel() * dtype_size  # angles has same dtype as c/b
-    # if has_bias:
-    #     num_bytes_read += (c_bias.numel() + b_bias.numel()) * dtype_size * nheads * 2
-    # if has_trap:
-    #     num_bytes_read += trap.numel() * dtype_size
-    # # Write: out
-    # num_bytes_write = out_triton.numel() * dtype_size
-    # num_io = num_bytes_read + num_bytes_write
+    # Calculate memory I/O (without states)
+    dtype_size = X.element_size()  # bytes per element (2 for fp16/bf16)
+    # Read: C, B, X
+    num_bytes_read = (P_mamba.numel() + X.numel()) * dtype_size
+    # Write: out
+    num_bytes_write = out_triton.numel() * dtype_size
+    num_io = num_bytes_read + num_bytes_write
 
-    # # Calculate memory I/O with states
-    # # States: (batch, num_chunks, nheads, headdim_bc, headdim_x) in float32 (4 bytes)
-    # num_chunks = triton.cdiv(seqlen, 128)  # Assuming chunk_size=128
-    # num_states_elements = batch * num_chunks * nheads * headdim_bc * headdim_x
-    # num_bytes_states = num_states_elements * 4  # float32
-    # num_io_with_states = num_io + num_bytes_states
+    # Calculate memory I/O with states
+    # States: (batch, num_chunks, nheads, headdim_bc, headdim_x) in float32 (4 bytes)
+    num_chunks = triton.cdiv(seqlen, 128)  # Assuming chunk_size=128
+    num_states_elements = batch * num_chunks * nheads * headdim_bc * headdim_x
+    num_bytes_states = num_states_elements * 4  # float32
+    num_io_with_states = num_io + num_bytes_states
 
-    # print(f"Memory I/O (without states): {num_io / 1e9:.2f} GB (Read: {num_bytes_read / 1e9:.2f} GB, Write: {num_bytes_write / 1e9:.2f} GB)")
-    # print(f"Memory I/O (with states):    {num_io_with_states / 1e9:.2f} GB (additional {num_bytes_states / 1e9:.2f} TB for states)")
+    print(f"Memory I/O (without states): {num_io / 1e9:.2f} GB (Read: {num_bytes_read / 1e9:.2f} GB, Write: {num_bytes_write / 1e9:.2f} GB)")
+    print(f"Memory I/O (with states):    {num_io_with_states / 1e9:.2f} GB (additional {num_bytes_states / 1e9:.2f} TB for states)")
 
-    # # Make sure everything is contiguous for benchmarking
-    # # can you write a loop to do this for all input tensors (loop, not manually doing each of them)
-    # P = P.contiguous()
-    # x = x.contiguous()
-    # if dt is not None:
-    #     dt = dt.contiguous()
-    # if dA is not None:
-    #     dA = dA.contiguous()
-    #     dA_cs = dA_cs.contiguous()
-    #     dA_cs_rev = dA_cs_rev.contiguous()
-    # if z is not None:
-    #     z = z.contiguous()
-    # if c_bias is not None:
-    #     c_bias = c_bias.contiguous()
-    # if b_bias is not None:
-    #     b_bias = b_bias.contiguous()
-    # if c_store is not None:
-    #     c_store = c_store.contiguous()
-    # if b_store is not None:
-    #     b_store = b_store.contiguous()
-    # if cb_store is not None:
-    #     cb_store = cb_store.contiguous()
-    # if angles is not None:
-    #     angles = angles.contiguous()
-    # if trap is not None:
-    #     trap = trap.contiguous()
-    # # Benchmark Triton (without states)
+    # Make sure everything is contiguous for benchmarking
+    # can you write a loop to do this for all input tensors (loop, not manually doing each of them)
+    P_mamba = P_mamba.contiguous()
+    X = X.contiguous()
+    if dA is not None:
+        dA = dA.contiguous()
+        dA_cs = dA_cs.contiguous()
+        dA_cs_rev = dA_cs_rev.contiguous()
+
+    # Benchmark Triton (without states)
+    torch.cuda.synchronize()
+    #TODO(kartiksrinivas): Why is this sleep needed?
+    time.sleep(1.0)
+    fn = lambda: ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, chunk_size=chunk_size_triton, store_states=False)
+    t_triton = do_bench_cudagraph(fn, rep=30)
+    mem_bw_triton = num_io / t_triton / 1e9
+    print(f"Triton (no states): {t_triton:.3f} ms, {mem_bw_triton:.2f} TB/s")
+
+    # # Benchmark Triton (with states)
     # torch.cuda.synchronize()
     # time.sleep(1.0)
-    # fn = lambda: ssd_fwd_triton(c, b, x, dt=dt, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, z=z, chunk_size=chunk_size_triton, store_states=False, c_bias=c_bias, b_bias=b_bias, c_store=c_store, b_store=b_store, angles=angles, trap=trap, cb_store=cb_store)
-    # t_triton = do_bench_cudagraph(fn, rep=30)
-    # mem_bw_triton = num_io / t_triton / 1e9
-    # print(f"Triton (no states): {t_triton:.3f} ms, {mem_bw_triton:.2f} TB/s")
+    # t_triton_states = do_bench(lambda: ssd_fwd_triton(c, b, x, dt=dt, dA=dA, chunk_size=128, store_states=True), warmup=10, rep=30)
+    # mem_bw_triton_states = num_io_with_states / t_triton_states / 1e9
+    # print(f"Triton (with states): {t_triton_states:.3f} ms, {mem_bw_triton_states:.2f} TB/s")
+    # print(f"Overhead of storing states: {(t_triton_states - t_triton) / t_triton * 100:.1f}%")
 
-    # # # Benchmark Triton (with states)
-    # # torch.cuda.synchronize()
-    # # time.sleep(1.0)
-    # # t_triton_states = do_bench(lambda: ssd_fwd_triton(c, b, x, dt=dt, dA=dA, chunk_size=128, store_states=True), warmup=10, rep=30)
-    # # mem_bw_triton_states = num_io_with_states / t_triton_states / 1e9
-    # # print(f"Triton (with states): {t_triton_states:.3f} ms, {mem_bw_triton_states:.2f} TB/s")
-    # # print(f"Overhead of storing states: {(t_triton_states - t_triton) / t_triton * 100:.1f}%")
+    # from flash_attn.cute.benchmark import pytorch_profiler
+    # pytorch_profiler(fn)
 
-    # # from flash_attn.cute.benchmark import pytorch_profiler
-    # # pytorch_profiler(fn)
-
-    # gc.enable()
+    gc.enable()
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
     test_ema(
-        batch=4,
+        batch=16,
         seqlen=2048,
         nheads=32,
         nheads_bc=32,
