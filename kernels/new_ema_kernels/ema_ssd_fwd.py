@@ -208,41 +208,22 @@ def chunk_cumsum_triton(
         for w in [2, 4, 8]
         for r in [128, 256]
     ],
-    key=["CHUNK_SIZE", "BLOCK_HEADDIM_BC", "BLOCK_HEADDIM_X", "STORE_STATES", "HAS_DT", "HAS_DA", "HAS_D", "HAS_Z", "HAS_BIAS", "APPLY_ROTARY", "HAS_TRAP"],
+    key=["CHUNK_SIZE", "BLOCK_HEADDIM_X", "STORE_STATES"],
 )
 @triton.jit
 def ema_fwd_kernel(
-    C, B, X, DT, DA, DA_CS, DA_CS_REV, D, Z, Out, States, C_bias, B_bias, C_bias_store, B_bias_store, CB_store, Angles, Trap,
-    stride_c_batch, stride_c_seqlen, stride_c_head, stride_c_dim,
-    stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dim,
+    X, DA, DA_CS, DA_CS_REV, Out, States, 
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_dim,
-    stride_dt_batch, stride_dt_head, stride_dt_seqlen,
     stride_da_batch, stride_da_head, stride_da_seqlen,
     stride_dacs_batch, stride_dacs_head, stride_dacs_seqlen,
     stride_dacsrev_batch, stride_dacsrev_head, stride_dacsrev_seqlen,
-    stride_D_head,
-    stride_z_batch, stride_z_seqlen, stride_z_head, stride_z_dim,
     stride_o_batch, stride_o_seqlen, stride_o_head, stride_o_dim,
     stride_s_batch, stride_s_chunk, stride_s_head, stride_s_hdim_bc, stride_s_hdim_x,
-    stride_c_bias_head, stride_c_bias_dim,
-    stride_b_bias_head, stride_b_bias_dim,
-    stride_c_store_batch, stride_c_store_head, stride_c_store_seqlen, stride_c_store_dim,
-    stride_b_store_batch, stride_b_store_head, stride_b_store_seqlen, stride_b_store_dim,
-    stride_cb_store_batch, stride_cb_store_head, stride_cb_store_seqlen,
-    stride_angles_batch, stride_angles_seqlen, stride_angles_head, stride_angles_dim,
-    stride_trap_batch, stride_trap_head, stride_trap_seqlen,
     seqlen, headdim_bc, headdim_x, nheads_bc, batch, nheads,
     CHUNK_SIZE: tl.constexpr,
-    BLOCK_HEADDIM_BC: tl.constexpr,
+    # BLOCK_HEADDIM_BC: tl.constexpr,
     BLOCK_HEADDIM_X: tl.constexpr,
     STORE_STATES: tl.constexpr,
-    HAS_DT: tl.constexpr,
-    HAS_DA: tl.constexpr,
-    HAS_D: tl.constexpr,
-    HAS_Z: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    APPLY_ROTARY: tl.constexpr,
-    HAS_TRAP: tl.constexpr,
 ):
     """
     SSD forward kernel in Triton with TMA loads.
@@ -261,78 +242,24 @@ def ema_fwd_kernel(
     pid_batch = tl.program_id(1)
 
     # Compute head index for C/B (for GQA support)
-    head_idx_bc = pid_head // (nheads // nheads_bc)
-
-    # Compute base pointers for this specific (batch, head) pair
-    # This gives us a 2D slice (seqlen, headdim) to work with
-    c_ptr = C + pid_batch * stride_c_batch + head_idx_bc * stride_c_head
-    b_ptr = B + pid_batch * stride_b_batch + head_idx_bc * stride_b_head
     x_ptr = X + pid_batch * stride_x_batch + pid_head * stride_x_head
     o_ptr = Out + pid_batch * stride_o_batch + pid_head * stride_o_head
-    if HAS_DT:
-        dt_ptr = DT + pid_batch * stride_dt_batch + pid_head * stride_dt_head
-    if HAS_DA:
-        da_ptr = DA + pid_batch * stride_da_batch + pid_head * stride_da_head
-        dacs_ptr = DA_CS + pid_batch * stride_dacs_batch + pid_head * stride_dacs_head
-        dacsrev_ptr = DA_CS_REV + pid_batch * stride_dacsrev_batch + pid_head * stride_dacsrev_head
-    if HAS_D:
-        D_ptr = D + pid_head * stride_D_head
-    if HAS_Z:
-        z_ptr = Z + pid_batch * stride_z_batch + pid_head * stride_z_head
-    if HAS_BIAS:
-        c_bias_ptr = C_bias + pid_head * stride_c_bias_head
-        b_bias_ptr = B_bias + pid_head * stride_b_bias_head
-    if APPLY_ROTARY:
-        angle_ptr = Angles + pid_batch * stride_angles_batch + pid_head * stride_angles_head
-    if HAS_TRAP:
-        trap_ptr = Trap + pid_batch * stride_trap_batch + pid_head * stride_trap_head
-        cb_store_ptr = CB_store + pid_batch * stride_cb_store_batch + pid_head * stride_cb_store_head
-    if HAS_BIAS or APPLY_ROTARY or HAS_TRAP:
-        c_store_ptr = C_bias_store + pid_batch * stride_c_store_batch + pid_head * stride_c_store_head
-        b_store_ptr = B_bias_store + pid_batch * stride_b_store_batch + pid_head * stride_b_store_head
+
+    da_ptr = DA + pid_batch * stride_da_batch + pid_head * stride_da_head
+    dacs_ptr = DA_CS + pid_batch * stride_dacs_batch + pid_head * stride_dacs_head
+    dacsrev_ptr = DA_CS_REV + pid_batch * stride_dacsrev_batch + pid_head * stride_dacsrev_head
 
     num_chunks = tl.cdiv(seqlen, CHUNK_SIZE)
 
     # Create TMA descriptors for 2D tensors (seqlen, headdim)
     # We load 2D blocks of shape (CHUNK_SIZE, headdim)
-    c_desc = tl.make_tensor_descriptor(
-        c_ptr,
-        shape=[seqlen, headdim_bc],
-        strides=[stride_c_seqlen, stride_c_dim],
-        block_shape=[CHUNK_SIZE, BLOCK_HEADDIM_BC],
-    )
-    b_desc = tl.make_tensor_descriptor(
-        b_ptr,
-        shape=[seqlen, headdim_bc],
-        strides=[stride_b_seqlen, stride_b_dim],
-        block_shape=[CHUNK_SIZE, BLOCK_HEADDIM_BC],
-    )
+
     x_desc = tl.make_tensor_descriptor(
         x_ptr,
         shape=[seqlen, headdim_x],
         strides=[stride_x_seqlen, stride_x_dim],
         block_shape=[CHUNK_SIZE, BLOCK_HEADDIM_X],
     )
-    if HAS_Z:
-        z_desc = tl.make_tensor_descriptor(
-            z_ptr,
-            shape=[seqlen, headdim_x],
-            strides=[stride_z_seqlen, stride_z_dim],
-            block_shape=[CHUNK_SIZE, BLOCK_HEADDIM_X],
-        )
-    if HAS_BIAS or APPLY_ROTARY or HAS_TRAP:
-        c_store_desc = tl.make_tensor_descriptor(
-            c_store_ptr,
-            shape=[seqlen, headdim_bc],
-            strides=[stride_c_store_seqlen, stride_c_store_dim],
-            block_shape=[CHUNK_SIZE, BLOCK_HEADDIM_BC],
-        )
-        b_store_desc = tl.make_tensor_descriptor(
-            b_store_ptr,
-            shape=[seqlen, headdim_bc],
-            strides=[stride_b_store_seqlen, stride_b_store_dim],
-            block_shape=[CHUNK_SIZE, BLOCK_HEADDIM_BC],
-        )
     o_desc = tl.make_tensor_descriptor(
         o_ptr,
         shape=[seqlen, headdim_x],
@@ -349,92 +276,12 @@ def ema_fwd_kernel(
             states_ptr,
             shape=[num_chunks, headdim_bc, headdim_x],
             strides=[stride_s_chunk, stride_s_hdim_bc, stride_s_hdim_x],
-            block_shape=[1, BLOCK_HEADDIM_BC, BLOCK_HEADDIM_X],
+            block_shape=[1, 1, BLOCK_HEADDIM_X],
         )
 
     # Initialize cumulative states: States = sum(B[i]^T @ X[i])
     # Register analysis [RA]: 128*64/128 = 64 regs/thread; live = 64
-    acc_states = tl.zeros([BLOCK_HEADDIM_BC, BLOCK_HEADDIM_X], dtype=tl.float32)
-
-    # Process each chunk sequentially
-    if HAS_BIAS or APPLY_ROTARY or HAS_TRAP:
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * CHUNK_SIZE
-            offs_seqlen = chunk_start + tl.arange(0, CHUNK_SIZE)
-            # ============================================================
-            # Load B and X for current chunk using TMA
-            # ============================================================
-            # TMA load expects scalar block indices: (seqlen_block_idx, headdim_block_idx)
-            # Since block_shape=[CHUNK_SIZE, BLOCK_HEADDIM_BC], we pass (chunk_idx, 0)
-            offs_hd = tl.arange(0, BLOCK_HEADDIM_BC)
-            b_pre_block = tl.load(b_ptr + offs_seqlen[:, None] * stride_b_seqlen + offs_hd[None, :] * stride_b_dim)
-            c_pre_block = tl.load(c_ptr + offs_seqlen[:, None] * stride_c_seqlen + offs_hd[None, :] * stride_c_dim)
-            # b_pre_block = b_desc.load([chunk_start, 0])
-            # c_pre_block = c_desc.load([chunk_start, 0])
-
-            if HAS_BIAS:
-                c_bias_block = tl.load(c_bias_ptr + offs_hd * stride_c_bias_dim)
-                c_pre_block += c_bias_block[None, :]
-                b_bias_block = tl.load(b_bias_ptr + offs_hd * stride_b_bias_dim)
-                b_pre_block += b_bias_block[None, :]
-
-            if HAS_TRAP and HAS_DT:
-                bc_dot = tl.sum(b_pre_block.to(tl.float32) * c_pre_block.to(tl.float32), axis=1).to(b_desc.dtype)  # (CHUNK_SIZE,)
-
-            #-------------------
-            
-            if APPLY_ROTARY:
-                offs_hdr = tl.arange(0, BLOCK_HEADDIM_BC // 2)
-                angle_block = tl.load(
-                    angle_ptr + offs_seqlen[:, None] * stride_angles_seqlen + offs_hdr[None, :] * stride_angles_dim)
-                cos_block = cos_approx(angle_block.to(tl.float32))  
-                sin_block = sin_approx(angle_block.to(tl.float32))
-                # cos_block = tl.cos(angle_block.to(tl.float32))
-                # sin_block = tl.sin(angle_block.to(tl.float32))
-
-                # Apply rotary embeddings
-                b0, b1 = tl.split(tl.reshape(b_pre_block, [CHUNK_SIZE, BLOCK_HEADDIM_BC // 2, 2]))
-                bo0 = b0 * cos_block - b1 * sin_block
-                bo1 = b0 * sin_block + b1 * cos_block
-                b_pre_block = tl.reshape(tl.join(bo0, bo1), [CHUNK_SIZE, BLOCK_HEADDIM_BC]).to(b_desc.dtype)
-            
-            if HAS_TRAP and HAS_DT:
-                aligned_trap_chunk = tl.load(trap_ptr + offs_seqlen * stride_trap_seqlen).to(tl.float32)
-                aligned_dt_chunk = tl.load(dt_ptr + offs_seqlen * stride_dt_seqlen).to(tl.float32)
-                aligned_gamma = aligned_dt_chunk * aligned_trap_chunk
-
-                trap_shifted_chunk = tl.load(trap_ptr + (offs_seqlen+1) * stride_trap_seqlen, mask = offs_seqlen < seqlen - 1, other=0.0).to(tl.float32)
-                dt_shifted_chunk = tl.load(dt_ptr + (offs_seqlen+1) * stride_dt_seqlen, mask = offs_seqlen < seqlen - 1, other=0.0).to(tl.float32)
-                shifted_gamma = dt_shifted_chunk * (1-trap_shifted_chunk)
-
-                scale = aligned_gamma + shifted_gamma
-                b_pre_block *= scale[:, None]
-                bc_dot *= shifted_gamma
-                tl.store(cb_store_ptr + offs_seqlen * stride_cb_store_seqlen, bc_dot)
-
-            tl.store(b_store_ptr + offs_seqlen[:, None] * stride_b_store_seqlen + offs_hd[None, :] * stride_b_store_dim, b_pre_block)
-            # b_store_desc.store(
-            #     [0, 0],
-            #     b_pre_block
-            # )
-            # b_block = b_pre_block.to(c_desc.dtype)
-
-            #-------------------
-
-            if APPLY_ROTARY:
-                # Apply rotary embeddings
-                c0, c1 = tl.split(tl.reshape(c_pre_block, [CHUNK_SIZE, BLOCK_HEADDIM_BC // 2, 2]))
-                co0 = c0 * cos_block - c1 * sin_block
-                co1 = c0 * sin_block + c1 * cos_block
-                c_pre_block = tl.reshape(tl.join(co0, co1), [CHUNK_SIZE, BLOCK_HEADDIM_BC]).to(c_desc.dtype)
-            
-            if (HAS_TRAP and HAS_DT) or HAS_BIAS:
-                tl.store(c_store_ptr + offs_seqlen[:, None] * stride_c_store_seqlen + offs_hd[None, :] * stride_c_store_dim, c_pre_block)
-            # c_store_desc.store(
-            #     [0, 0],
-            #     c_pre_block
-            # )
-
+    acc_states = tl.zeros([1, BLOCK_HEADDIM_X], dtype=tl.float32)
 
     # tl.debug_barrier()
 
@@ -442,77 +289,50 @@ def ema_fwd_kernel(
         chunk_start = chunk_idx * CHUNK_SIZE
         offs_seqlen = chunk_start + tl.arange(0, CHUNK_SIZE)
 
-        if HAS_BIAS or APPLY_ROTARY or HAS_TRAP:
-            b_block = b_store_desc.load([chunk_start, 0])
-            c_block = c_store_desc.load([chunk_start, 0])
-        else:
-            b_block = b_desc.load([chunk_start, 0])
-            c_block = c_desc.load([chunk_start, 0])
-
         x_block = x_desc.load([chunk_start, 0])
         seqlen_mask = offs_seqlen < seqlen
-        if HAS_DT:
-            # Load dt for current chunk: (CHUNK_SIZE,)
-            dt_chunk = tl.load(dt_ptr + offs_seqlen * stride_dt_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
-        if HAS_DA:
-            # Load dA for current chunk: (CHUNK_SIZE,)
-            da_chunk = tl.load(da_ptr + offs_seqlen * stride_da_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
-            dacs_chunk = tl.load(dacs_ptr + offs_seqlen * stride_dacs_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
-            dacsrev_chunk = tl.load(dacsrev_ptr + offs_seqlen * stride_dacsrev_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
+
+        # Load dA for current chunk: (CHUNK_SIZE,)
+        da_chunk = tl.load(da_ptr + offs_seqlen * stride_da_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
+        dacs_chunk = tl.load(dacs_ptr + offs_seqlen * stride_dacs_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
+        dacsrev_chunk = tl.load(dacsrev_ptr + offs_seqlen * stride_dacsrev_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
+
+        ##################################################################################################
+        # Compute Output using cumulative states
+        ##################################################################################################
+
         # O = C @ States: (CHUNK_SIZE, headdim_bc) @ (headdim_bc, headdim_x)
         # This uses states accumulated from all previous chunks
-        acc_o = tl.dot(c_block, acc_states.to(c_block.dtype))
-        if HAS_DA:
-            acc_o *= tl.exp2(dacs_chunk)[:, None]
-        # Compute S = C @ B^T: (CHUNK_SIZE, headdim_bc) @ (headdim_bc, CHUNK_SIZE)
-        s_block = tl.dot(c_block, tl.trans(b_block))
-        if HAS_DT and not HAS_TRAP:
-            s_block *= dt_chunk[None, :]
-        # Apply causal mask
-        if not HAS_DA:  # dA will be zero out side the causal mask
-            offs_c_local = tl.arange(0, CHUNK_SIZE)
-            causal_mask = offs_c_local[:, None] >= offs_c_local[None, :]
-            s_block = tl.where(causal_mask, s_block, 0.0)
-        if HAS_DA:
-            s_block *= tl.exp2(segsum_triton(da_chunk, CHUNK_SIZE))
-            # s_block *= tl.exp2(segsum_unstable_triton(dacs_chunk, CHUNK_SIZE))
+        c_block = tl.ones([CHUNK_SIZE, 1], dtype=tl.float32)  # EMA: C is all ones 
+        # (CHUNK_SIZE, headdim_x)
+        acc_o = tl.dot(c_block, acc_states.to(c_block.dtype)) # maybe this might throw an error here
+        # TODO(kartiksrinivas): This is just a tl.repeat(), that should be faster than tl.dot()?
+        # TODO(kartiksrinivas): Where are these things residing?
+        #TODO(kartiksrinivas): The present chunk decays
+        acc_o *= tl.exp2(dacs_chunk)[:, None] 
+        # (CHUNK_SIZE, CHUNK_SIZE)
+        s_block = tl.exp2(segsum_triton(da_chunk, CHUNK_SIZE))
         # O += causal(S) @ X: (CHUNK_SIZE, CHUNK_SIZE) @ (CHUNK_SIZE, headdim_x)
         acc_o += tl.dot(s_block.to(x_block.dtype), x_block)
-        if HAS_D:
-            D_val = tl.load(D_ptr).to(tl.float32)
-            if HAS_TRAP and HAS_DT:
-                bc_dot = tl.load(cb_store_ptr + offs_seqlen * stride_cb_store_seqlen).to(tl.float32)
-                acc_o += (D_val-bc_dot)[:, None] * x_block.to(tl.float32)
-            else:
-                acc_o += D_val * x_block.to(tl.float32)
-        # Apply z gating if present: out = out * z * sigmoid(z)
-        if HAS_Z:
-            z_block = z_desc.load([chunk_start, 0])
-            acc_o = acc_o * silu(z_block.to(tl.float32))
-        # Store output using TMA
         o_desc.store([chunk_start, 0], acc_o.to(x_block.dtype))
-        # Update states for next chunk
-        # States += B^T @ X: (headdim_bc, CHUNK_SIZE) @ (CHUNK_SIZE, headdim_x)
-        if not HAS_DT and not HAS_DA:
-            acc_states += tl.dot(tl.trans(b_block), x_block)
-        else:
-            if not HAS_DT:
-                scale = tl.exp2(dacsrev_chunk)[:, None]
-            elif not HAS_TRAP:
-                scale = dt_chunk[:, None] if not HAS_DA else (dt_chunk[:, None] * tl.exp2(dacsrev_chunk[:, None]))
-            elif HAS_DA:
-                scale = tl.exp2(dacsrev_chunk[:, None])
-            else:
-                scale = 1.0
-            b_block_scaled = (b_block * scale).to(x_block.dtype)
-            if HAS_DA:
-                dasum = tl.load(dacs_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_dacs_seqlen)
-                acc_states *= tl.exp2(dasum)
-            acc_states += tl.dot(tl.trans(b_block_scaled), x_block)
+
+
+        ##################################################################################################
+        # Update cumulative states
+        ##################################################################################################
+
+        # (CHUNK_SIZE, 1) -- This is the reverse (1 - p_2) 1 (last row per chunk)
+        scale = tl.exp2(dacsrev_chunk[:, None]).to(x_block.dtype)
+        # Scalar -- this is the TOTAL decay of the present chunk
+        dasum = tl.load(dacs_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_dacs_seqlen)
+        # Decay the states and add the present final state, this is an ema update
+        acc_states *= tl.exp2(dasum)
+        acc_states += tl.dot(tl.trans(scale), x_block)
+
         # Optionally store accumulated states to global memory using TMA
         if STORE_STATES:
-            # States shape: (batch, num_chunks, nheads, headdim_bc, headdim_x)
-            states_block = tl.reshape(acc_states, [1, BLOCK_HEADDIM_BC, BLOCK_HEADDIM_X])
+            # States shape: (batch, num_chunks, nheads, headdim_bc=1, headdim_x)
+            states_block = tl.reshape(acc_states, [1, 1, BLOCK_HEADDIM_X])
             states_desc.store([chunk_idx, 0, 0], states_block)
 
 
@@ -589,9 +409,10 @@ def ema_fwd_triton(
         assert z.is_cuda, "z tensor must be on CUDA"
 
     # Round up head dims to multiples of 16 for efficient loading
-    # TODO(kartiksrinivas): There should be no blocking over headdim_bc
+    # TODO(kartiksrinivas): There should be no blocking over headdim_bc since it is 1
     # BLOCK_HEADDIM_BC = triton.next_power_of_2(headdim_bc) # interesting, there cannot be blocking over this one
-    BLOCK_HEADDIM_X = triton.next_power_of_2(headdim_x)
+    #TODO(kartiksrinivas): The whole thing is being loaded?
+    BLOCK_HEADDIM_X = triton.next_power_of_2(headdim_x) 
 
     # Grid: each program handles one (head, batch) pair and processes all chunks sequentially
     grid = (nheads, batch)
