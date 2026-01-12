@@ -464,6 +464,7 @@ def segsum(x):
     return x_segsum
 
 
+
 def ema_torch_ref(
     X: torch.Tensor,
     P: torch.Tensor
@@ -478,7 +479,7 @@ def ema_torch_ref(
         x_t = X[:, t, :]    # (batch, dim)
         p_t = P[:, t, :]    # (batch, 1)
 
-        state = state * (1 - p_t) + x_t * p_t
+        state = state * (1 - p_t) + x_t
         out.append(state)
 
     out = torch.stack(out, dim=1)  # (batch, seqlen, token_dim)
@@ -492,15 +493,8 @@ def test_ema(
     nheads_bc=32,
     headdim_bc=64,
     headdim_x=64,
-    dtype=torch.float32,
+    dtype=torch.bfloat16,
     device="cuda",
-    has_dt=False,
-    has_dA=False,
-    has_D=False,
-    has_z=False,
-    has_bias=False,
-    has_rotary=False,
-    has_trap=False,
 ):
     assert nheads % nheads_bc == 0
     # TODO(kartiksrinivas): how is this chunk size chosen and why?
@@ -508,23 +502,21 @@ def test_ema(
 
     # Create input tensors
     X = torch.randn(batch, seqlen, nheads, headdim_x, dtype=dtype, device=device)
-    #TODO(kartiksrinivas): You can repeat this for every head
+    #TODO(kartiksrinivas): You can repeat this for every head  -- do we need to do that though?
+    #TODO(kartiksrinivas): This is more memory consumption (but it makes things parallel)
+    #TODO(kartiksrinivas): Maybe can we use a TMA multicast to load the same value across multiple heads (programs?)
     P = torch.rand(batch, seqlen, 1, dtype=dtype, device=device) 
     P_mamba = einops.repeat(P, 'b s 1 -> b s h', h=nheads)  
-    P_mamba = einops.rearrange(P_mamba , 'b s h -> b h s')  
-
+    P_mamba = einops.rearrange(P_mamba , 'b s h -> b h s')
     
     c_ref, b_ref, x_ref = c.float(), b.float(), x.float()
 
-    # Create dA tensor if requested
-    dA = None
-    if has_dA:  # These are scaled by math.log2(e) so that we can call tl.exp2 instead of tl.exp
-        dA = torch.log(1 - P_mamba) * math.log2(math.e)
-        dA_cs, dA_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size_triton)
+    dA = torch.log(1 - P_mamba) * math.log2(math.e)
+    dA_cs, dA_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size_triton)
 
     # Test Triton implementation``
     print("\n=== Testing Triton Implementation ===")
-    out_triton = ema_fwd_triton(c, b, x, dt=dt, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, D=D, z=z, chunk_size=chunk_size_triton, c_bias=c_bias, b_bias=b_bias, c_store=c_store, b_store=b_store, angles=angles, trap=trap, cb_store=cb_store)
+    out_triton = ema_fwd_triton(c, b, x, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, chunk_size=chunk_size_triton, store_states=False)
     out_ref = ema_torch_ref(einops.rearrange(X, "b s h d -> b s (h d)"), P)
 
     print("\n=== Correctness ===")
@@ -619,5 +611,13 @@ def test_ema(
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    # test_ssd(1, 128, 1, 1, headdim_bc=64, headdim_x=128, has_dt=True, has_dA=True, has_D=True, has_z=False)
-    test_ema(16, 2048, 32, 1, headdim_bc=128, headdim_x=64, has_dt=True, has_dA=True, has_D=True, has_z=True, has_bias=True, has_rotary=True, has_trap=True)
+    test_ema(
+        batch=4,
+        seqlen=2048,
+        nheads=32,
+        nheads_bc=32,
+        headdim_bc=1,
+        headdim_x=64,
+        dtype=torch.float32,
+        device="cuda",
+    )
