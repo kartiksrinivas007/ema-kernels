@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+import einops
 
 
 @triton.jit
@@ -301,19 +302,26 @@ def ema_fwd_kernel(
         # Compute Output using cumulative states
         ##################################################################################################
 
-        # O = C @ States: (CHUNK_SIZE, headdim_bc) @ (headdim_bc, headdim_x)
-        # This uses states accumulated from all previous chunks
-        c_block = tl.ones([CHUNK_SIZE, 1], dtype=tl.float32)  # EMA: C is all ones 
-        # (CHUNK_SIZE, headdim_x)
-        acc_o = tl.dot(c_block, acc_states.to(c_block.dtype)) # maybe this might throw an error here
-        # TODO(kartiksrinivas): This is just a tl.repeat(), that should be faster than tl.dot()?
         # TODO(kartiksrinivas): Where are these things residing?
-        #TODO(kartiksrinivas): The present chunk decays
-        acc_o *= tl.exp2(dacs_chunk)[:, None] 
+
+        #=================================
+        # Use new start state of chunk
+        # multiply with per-position decay
+        # TODO(kartiksrinivas): is using these adds the best way to broadcast?
+        #=================================
+  
+        # O = (1, BLOCK_HEADDIM_X) + (CHUNK_SIZE, BLOCK_HEADDIM_X) = (CHUNK_SIZE, BLOCK_HEADDIM_X)
+        acc_o = acc_states.to(tl.float32) + tl.zeros([CHUNK_SIZE, BLOCK_HEADDIM_X], tl.float32)
+        acc_o *= tl.exp2(dacs_chunk)[:, None] # Multiply with the decay
+
+        #=================================
+        # Add the present chunk contribution to output
+        #=================================
         # (CHUNK_SIZE, CHUNK_SIZE)
         s_block = tl.exp2(segsum_triton(da_chunk, CHUNK_SIZE))
         # O += causal(S) @ X: (CHUNK_SIZE, CHUNK_SIZE) @ (CHUNK_SIZE, headdim_x)
         acc_o += tl.dot(s_block.to(x_block.dtype), x_block)
+        # Store output block
         o_desc.store([chunk_start, 0], acc_o.to(x_block.dtype))
 
 
@@ -389,10 +397,11 @@ def ema_fwd_triton(
     assert dA_cs.shape == dA.shape, "dA_cs must have same shape as dA"
     assert dA_cs_rev.shape == dA.shape, "dA_cs_rev must have same shape as dA"
 
-    _, _, nheads, headdim_x = x.shape
+    batch, seqlen, nheads, headdim_x = x.shape
     # d_state is 1 since this is an EMA
     headdim_bc = 1
     num_chunks = triton.cdiv(seqlen, chunk_size)
+    nheads_bc = nheads  # set to be the same here
 
     if out is None:
         out = torch.empty_like(x)
@@ -401,12 +410,6 @@ def ema_fwd_triton(
                             dtype=torch.float32, device=c.device)
     else:
         states = None
-        dA_cs_rev = torch.empty(0, dtype=torch.float32, device=c.device)
-
-    if has_D:
-        assert D.is_cuda, "D tensor must be on CUDA"
-    if has_z:
-        assert z.is_cuda, "z tensor must be on CUDA"
 
     # Round up head dims to multiples of 16 for efficient loading
     # TODO(kartiksrinivas): There should be no blocking over headdim_bc since it is 1
@@ -416,6 +419,7 @@ def ema_fwd_triton(
 
     # Grid: each program handles one (head, batch) pair and processes all chunks sequentially
     grid = (nheads, batch)
+
 
     ema_fwd_kernel[grid](
         x, dA, dA_cs, dA_cs_rev, out, states, 
@@ -502,6 +506,7 @@ def test_ema(
 
     # Create input tensors
     X = torch.randn(batch, seqlen, nheads, headdim_x, dtype=dtype, device=device)
+    O = torch.zeros_like(X, dtype=dtype, device=device)
     #TODO(kartiksrinivas): You can repeat this for every head  -- do we need to do that though?
     #TODO(kartiksrinivas): This is more memory consumption (but it makes things parallel)
     #TODO(kartiksrinivas): Maybe can we use a TMA multicast to load the same value across multiple heads (programs?)
@@ -509,15 +514,18 @@ def test_ema(
     P_mamba = einops.repeat(P, 'b s 1 -> b s h', h=nheads)  
     P_mamba = einops.rearrange(P_mamba , 'b s h -> b h s')
     
-    c_ref, b_ref, x_ref = c.float(), b.float(), x.float()
 
     dA = torch.log(1 - P_mamba) * math.log2(math.e)
     dA_cs, dA_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size_triton)
+    
 
     # Test Triton implementation``
     print("\n=== Testing Triton Implementation ===")
-    out_triton = ema_fwd_triton(c, b, x, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, chunk_size=chunk_size_triton, store_states=False)
+    out_triton = ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, chunk_size=chunk_size_triton, store_states=False)
+    out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
     out_ref = ema_torch_ref(einops.rearrange(X, "b s h d -> b s (h d)"), P)
+
+    breakpoint()
 
     print("\n=== Correctness ===")
     print(f"Triton vs Ref f32, max diff = {(out_triton - out_ref).abs().max().item():.6f}, mean diff = {(out_triton - out_ref).abs().mean().item():.6f}")
