@@ -13,6 +13,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 import einops
+import os
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 
 
 @triton.jit
@@ -201,13 +203,25 @@ def chunk_cumsum_triton(
         EXP2=exp2,
     )
     return dA_cs, dA_cs_rev
-
+# -------------------------------------
+# OPTIMAL CONFIG float32:
+# -------------------------------------
+# best config selected: num_warps: 2, num_ctas: 1, num_stages: 3, maxnreg: 256;
+# @triton.autotune(
+#      configs=[
+#         triton.Config({}, num_stages=s, num_warps=w, maxnreg=r)
+#         for s in [1, 2, 3, 4]
+#         for w in [2, 4, 8]
+#         for r in [128, 256]
+#     ],
+#     key=["CHUNK_SIZE", "BLOCK_HEADDIM_X", "STORE_STATES"],
+# )
 @triton.autotune(
      configs=[
         triton.Config({}, num_stages=s, num_warps=w, maxnreg=r)
-        for s in [1, 2, 3, 4]
-        for w in [2, 4, 8]
-        for r in [128, 256]
+        for s in [3]
+        for w in [2]
+        for r in [256]
     ],
     key=["CHUNK_SIZE", "BLOCK_HEADDIM_X", "STORE_STATES"],
 )
@@ -332,9 +346,9 @@ def ema_fwd_kernel(
         # (CHUNK_SIZE, 1) -- This is the reverse (1 - p_2) 1 (last row per chunk)
         scale = tl.exp2(dacsrev_chunk[:, None]).to(x_block.dtype)
         # Scalar -- this is the TOTAL decay of the present chunk
-        dasum = tl.load(dacs_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_dacs_seqlen)
+        dasum = tl.load(dacs_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_dacs_seqlen).to(tl.float32)
         # Decay the states and add the present final state, this is an ema update
-        acc_states *= tl.exp2(dasum)
+        acc_states *= tl.exp2(dasum).to(acc_states.dtype)
         acc_states += tl.dot(tl.trans(scale), x_block)
 
         # Optionally store accumulated states to global memory using TMA
@@ -600,7 +614,7 @@ if __name__ == "__main__":
         batch=16,
         seqlen=2048,
         nheads=32,
-        nheads_bc=32,
+        nheads_bc=32, # unused anyways
         headdim_bc=1,
         headdim_x=64,
         dtype=torch.float32,
