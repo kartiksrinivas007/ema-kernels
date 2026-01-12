@@ -149,7 +149,7 @@ def _ema_scan_fwd_kernel(
         x = tl.load(x_ptrs, mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < token_dim), other=0.0)
 
         #(BLOCK_SIZE_M, BLOCK_SIZE_N)
-        acc += tl.dot(mat, x)
+        acc += tl.dot(mat, x, input_precision="ieee")
 
         
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen

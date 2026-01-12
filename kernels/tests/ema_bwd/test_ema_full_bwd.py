@@ -77,8 +77,8 @@ class TestEmaCombinedBwd:
         # print positions of mistmatch for first batch 
         print(torch.nonzero(torch.abs(dA_kernel_reshaped - dA_ref) > 1e-2)[0:10])   
 
-        assert torch.allclose(dx_kernel, dx_ref, atol=1e-2, rtol=1e-2)
-        assert torch.allclose(dA_kernel_reshaped, dA_ref, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(dx_kernel, dx_ref, atol=1e-3, rtol=1e-3)
+        assert torch.allclose(dA_kernel_reshaped, dA_ref, atol=1e-3, rtol=1e-3)
 
     def test_recompute_output_matches_forward(self):
         """

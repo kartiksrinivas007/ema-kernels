@@ -115,7 +115,7 @@ def _ema_chunk_state_fwd_kernel(
         # scale = tl.zeros((BLOCK_SIZE_Q, ), dtype=tl.float32) + 1.0
 
         # (BLOCK_SIZE_T, 1)
-        acc += tl.dot(x, scale[:, None])
+        acc += tl.dot(x, scale[:, None], input_precision="ieee")
 
         # update pointers
         x_ptrs += BLOCK_SIZE_Q * stride_x_seqlen
