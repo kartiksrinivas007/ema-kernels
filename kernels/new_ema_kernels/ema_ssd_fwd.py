@@ -525,23 +525,11 @@ triton.set_allocator(alloc_fn)
 
 
 def ema_fwd_triton(
-    c: torch.Tensor,  # (b, s, h_bc, d)
-    b: torch.Tensor,  # (b, s, h_bc, d)
     x: torch.Tensor,  # (b, s, h, dx)
-    dt: Optional[torch.Tensor] = None,  # (b, h, s)
     dA: Optional[torch.Tensor] = None,  # (b, h, s)
     dA_cs: Optional[torch.Tensor] = None,  # (b, h, s) - chunk cumsum of dA
     dA_cs_rev: Optional[torch.Tensor] = None,  # (b, h, s) - reverse chunk cumsum of dA
-    D: Optional[torch.Tensor] = None,  # (h)
-    z: Optional[torch.Tensor] = None,  # (b, s, h, dx)
     out: Optional[torch.Tensor] = None,  # (b, s, h, dx)
-    c_bias: Optional[torch.Tensor] = None,  # (h, d)
-    b_bias: Optional[torch.Tensor] = None,  # (h, d)
-    c_store: Optional[torch.Tensor] = None,  # (b, h, c, d)
-    b_store: Optional[torch.Tensor] = None,  # (b, h, c, d)
-    cb_store: Optional[torch.Tensor] = None,  # (b, h, c)
-    angles: Optional[torch.Tensor] = None,  # (b, s, h, d//2)
-    trap: Optional[torch.Tensor] = None,  # (b, s, h)
     chunk_size: int = 64,
     store_states: bool = False,
 ):
@@ -574,114 +562,57 @@ def ema_fwd_triton(
             states: Accumulated states tensor (b, num_chunks, h, d, dx)
     """
     assert chunk_size in [64, 128]
-    batch, seqlen, nheads_bc, headdim_bc = c.shape
+    assert dA is not None and dA_cs is not None and dA_cs_rev is not None
+    assert x.is_cuda, "Tensors must be on CUDA"
+    assert dA.is_cuda, "dA tensor must be on CUDA"
+    assert dA_cs.is_cuda and dA_cs_rev.is_cuda, "dA_cs tensors must be on CUDA"
+    assert dA_cs.shape == dA.shape, "dA_cs must have same shape as dA"
+    assert dA_cs_rev.shape == dA.shape, "dA_cs_rev must have same shape as dA"
+
     _, _, nheads, headdim_x = x.shape
+    # d_state is 1 since this is an EMA
+    headdim_bc = 1
+    num_chunks = triton.cdiv(seqlen, chunk_size)
+
     if out is None:
         out = torch.empty_like(x)
-    has_dt = dt is not None
-    has_da = dA is not None
-    if has_da:
-        assert dA_cs is not None and dA_cs_rev is not None
-    has_D = D is not None
-    has_z = z is not None
-    # Allocate states tensor only if storing
-    num_chunks = triton.cdiv(seqlen, chunk_size)
     if store_states:
         states = torch.empty(batch, num_chunks, nheads, headdim_bc, headdim_x,
                             dtype=torch.float32, device=c.device)
     else:
         states = None
-    assert (c_bias is None) == (b_bias is None)
-    if c_bias is not None:
-        assert c_bias.shape == (nheads, headdim_bc)
-        assert b_bias.shape == (nheads, headdim_bc)
-    assert (c_store is None) == (b_store is None)
-    if c_store is not None:
-        assert c_store.shape == (batch, nheads, seqlen, headdim_bc)
-        assert b_store.shape == (batch, nheads, seqlen, headdim_bc)
-    if angles is not None:
-        assert angles.shape == (batch, seqlen, nheads, headdim_bc // 2)
-    if trap is not None:
-        assert trap.shape == (batch, nheads, seqlen)
-    if cb_store is not None:
-        assert cb_store.shape == (batch, nheads, seqlen)
-
-    assert c.is_cuda and b.is_cuda and x.is_cuda, "Tensors must be on CUDA"
-    assert c.dtype in [torch.float16, torch.bfloat16], "Only fp16/bf16 supported"
-    if has_dt:
-        assert dt.is_cuda, "dt tensor must be on CUDA"
-    if has_da:
-        assert dA.is_cuda, "dA tensor must be on CUDA"
-        assert dA_cs.is_cuda and dA_cs_rev.is_cuda, "dA_cs tensors must be on CUDA"
-        assert dA_cs.shape == dA.shape, "dA_cs must have same shape as dA"
-        assert dA_cs_rev.shape == dA.shape, "dA_cs_rev must have same shape as dA"
-    else:
-        # Create dummy tensors if not provided
-        dA_cs = torch.empty(0, dtype=torch.float32, device=c.device)
         dA_cs_rev = torch.empty(0, dtype=torch.float32, device=c.device)
+
     if has_D:
         assert D.is_cuda, "D tensor must be on CUDA"
     if has_z:
         assert z.is_cuda, "z tensor must be on CUDA"
 
     # Round up head dims to multiples of 16 for efficient loading
-    BLOCK_HEADDIM_BC = triton.next_power_of_2(headdim_bc)
+    # TODO(kartiksrinivas): There should be no blocking over headdim_bc
+    # BLOCK_HEADDIM_BC = triton.next_power_of_2(headdim_bc) # interesting, there cannot be blocking over this one
     BLOCK_HEADDIM_X = triton.next_power_of_2(headdim_x)
 
     # Grid: each program handles one (head, batch) pair and processes all chunks sequentially
     grid = (nheads, batch)
 
-    ssd_fwd_kernel[grid](
-        c, b, x, dt, dA, dA_cs, dA_cs_rev, D, z, out, states, c_bias, b_bias, c_store, b_store, cb_store, angles, trap,
-        c.stride(0), c.stride(1), c.stride(2), c.stride(3),
-        b.stride(0), b.stride(1), b.stride(2), b.stride(3),
+    ema_fwd_kernel[grid](
+        x, dA, dA_cs, dA_cs_rev, out, states, 
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-        dt.stride(0) if has_dt else 0, dt.stride(1) if has_dt else 0, dt.stride(2) if has_dt else 0,
-        dA.stride(0) if has_da else 0, dA.stride(1) if has_da else 0, dA.stride(2) if has_da else 0,
-        dA_cs.stride(0) if has_da else 0, dA_cs.stride(1) if has_da else 0, dA_cs.stride(2) if has_da else 0,
-        dA_cs_rev.stride(0) if has_da else 0, dA_cs_rev.stride(1) if has_da else 0, dA_cs_rev.stride(2) if has_da else 0,
-        D.stride(0) if has_D else 0,
-        z.stride(0) if has_z else 0, z.stride(1) if has_z else 0, z.stride(2) if has_z else 0, z.stride(3) if has_z else 0,
+        dA.stride(0), dA.stride(1), dA.stride(2),
+        dA_cs.stride(0), dA_cs.stride(1), dA_cs.stride(2),
+        dA_cs_rev.stride(0), dA_cs_rev.stride(1), dA_cs_rev.stride(2),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         states.stride(0) if store_states else 0,
         states.stride(1) if store_states else 0,
         states.stride(2) if store_states else 0,
         states.stride(3) if store_states else 0,
         states.stride(4) if store_states else 0,
-        c_bias.stride(0) if c_bias is not None else 0,
-        c_bias.stride(1) if c_bias is not None else 0,
-        b_bias.stride(0) if b_bias is not None else 0,
-        b_bias.stride(1) if b_bias is not None else 0,
-        c_store.stride(0) if c_store is not None else 0,
-        c_store.stride(1) if c_store is not None else 0,
-        c_store.stride(2) if c_store is not None else 0,
-        c_store.stride(3) if c_store is not None else 0,
-        b_store.stride(0) if b_store is not None else 0,
-        b_store.stride(1) if b_store is not None else 0,
-        b_store.stride(2) if b_store is not None else 0,
-        b_store.stride(3) if b_store is not None else 0,
-        cb_store.stride(0) if cb_store is not None else 0,
-        cb_store.stride(1) if cb_store is not None else 0,
-        cb_store.stride(2) if cb_store is not None else 0,
-        angles.stride(0) if angles is not None else 0,
-        angles.stride(1) if angles is not None else 0,
-        angles.stride(2) if angles is not None else 0,
-        angles.stride(3) if angles is not None else 0,
-        trap.stride(0) if trap is not None else 0,
-        trap.stride(1) if trap is not None else 0,
-        trap.stride(2) if trap is not None else 0,
-        seqlen, headdim_bc, headdim_x, nheads_bc, batch, nheads,
+        seqlen, headdim_bc, headdim_x, nheads_bc, batch, nheads, # headdim_bc  = 1
         CHUNK_SIZE=chunk_size,
-        BLOCK_HEADDIM_BC=BLOCK_HEADDIM_BC,
+        # BLOCK_HEADDIM_BC=BLOCK_HEADDIM_BC,
         BLOCK_HEADDIM_X=BLOCK_HEADDIM_X,
         STORE_STATES=store_states,
-        HAS_DT=has_dt,
-        HAS_DA=has_da,
-        HAS_D=has_D,
-        HAS_Z=has_z,
-        HAS_BIAS=(c_bias is not None),
-        APPLY_ROTARY=(angles is not None),
-        HAS_TRAP=(trap is not None),
     )
 
     if store_states:
