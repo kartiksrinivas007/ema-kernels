@@ -110,6 +110,11 @@ def _chunk_state_fwd_kernel(
             scale = tl.exp(tl.minimum((dA_cs_last - dA_cs_k), 0.0)) * dt_k
         else:
             # scale = tl.where(seq_idx_k == seq_idx_last, tl.exp((dA_cs_last - dA_cs_k)) * dt_k, 0.0)
+            # NOTE(kartiksrinivas)
+            # Only apply the scaling when they belong to the same sequence, and otherwise the scale to multiply is zero
+            # But then you lose information about the next chunk entirely because for him this is not "his" sequence and all the 
+            # decays are lost.
+            # TODO(kartiksrinivas): why is the first thing needed??
             scale = tl.where((seq_idx_last >= 0) & (seq_idx_k == seq_idx_last), tl.exp(tl.minimum((dA_cs_last - dA_cs_k), 0.0)) * dt_k, 0.0)
         b *= scale[:, None]
         b = b.to(x_ptr.dtype.element_ty)

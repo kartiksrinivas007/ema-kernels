@@ -70,7 +70,10 @@ def _bmm_chunk_fwd_kernel(
         chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
         seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
         seq_idx_n = tl.load(seq_idx_ptr + offs_n * stride_seq_idx_seqlen, mask=offs_n < chunk_size_limit, other=-2)
-        acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0)
+        # NOTE: (kartiksrinivas): This will be a lower triangular matrix and also per sequence lower triangular
+        # NOTE: Think of this as sparse lower triangular, i, j is non zero in lower iff i and j are in the same 
+        # seq_idx
+        acc = tl.where(seq_idx_m[:, None] == seq_idx_n[None, :], acc, 0.0) # zero for any cross sequence interaction
     out = acc.to(out_ptr.dtype.element_ty)
 
     out_ptr += pid_b * stride_out_batch + pid_c * stride_out_chunk + pid_h * stride_out_head

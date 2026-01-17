@@ -74,6 +74,11 @@ def _chunk_scan_fwd_kernel(
 
     chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
     if HAS_SEQ_IDX:
+        # NOTE(kartiksrinivas): Comparing the final position of the previous chunk to the present chunk indexeso
+        # This makes total sense since this is the state that was passed and stored in the mamba_state_fwd
+        # kernel as well (remember, the final sequence produces the state), so the final state of the prev 
+        # sequence is the one that will be scanned forward. (others do not need one since their correct start state is
+        # just all zeroes)
         seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_seqlen, mask=pid_c >= 1, other=0)
         seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -89,6 +94,7 @@ def _chunk_scan_fwd_kernel(
         if not HAS_SEQ_IDX:
             scale_m = tl.exp(dA_cs_m)
         else:
+            # NOTE: This adds a decay only within the present sequence, otherwise sets the scale to zeroes
             scale_m = tl.where(seq_idx_m == seq_idx_prev, tl.exp(dA_cs_m), 0.0)
         if BLOCK_SIZE_DSTATE <= 128:
             C = tl.load(C_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_k_dstate[None, :] < dstate), other=0.0)

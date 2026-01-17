@@ -66,6 +66,7 @@ def _state_passing_fwd_kernel(
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
+            # NOTE: state pass only when the previosu chunk final seq idx matches the present chunk final seq idx
             seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
             seq_idx = seq_idx_new
