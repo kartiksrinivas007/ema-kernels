@@ -309,7 +309,8 @@ def ema_fwd_kernel(
 
     # tl.debug_barrier()
 
-    prev_chunk_seq_idx = -1 # stores the id of the previous chunk (register) 
+    prev_chunk_seq_idx = tl.full((), 0, tl.int8) # stores the id of the previous chunk (register) 
+
 
     for chunk_idx in range(num_chunks):
         chunk_start = chunk_idx * CHUNK_SIZE
@@ -378,7 +379,7 @@ def ema_fwd_kernel(
         ##################################################################################################
 
         # (CHUNK_SIZE, 1) -- This is the reverse (1 - p_2) 1 (last row per chunk)
-        scale = tl.exp2(dacsrev_chunk[:, None]).to(x_block.dtype)
+        scale = tl.exp2(dacsrev_chunk).to(x_block.dtype)
         # Scalar -- this is the TOTAL decay of the present chunk
         dasum = tl.load(dacs_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_dacs_seqlen).to(tl.float32)
 
@@ -386,15 +387,14 @@ def ema_fwd_kernel(
         if HAS_SEQ_IDX:
             # ! Why not load from seq_idx_chunk final position -- or do we free up registers?
             seq_idx_last = tl.load(seq_idx_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_seq_idx_seqlen)
-            # dasum = tl.where(seq_idx_mask, dasum, 0.0) # its a scalar tho
-            dasum = tl.where(seq_idx_chunk == prev_chunk_seq_idx, dasum, 0.0) # its a scalar tho
-            prev_chunk_seq_idx = seq_idx_last
+            acc_states = tl.where(seq_idx_last == prev_chunk_seq_idx, acc_states, 0.0) # its a scalar tho
             scale = tl.where(seq_idx_chunk == seq_idx_last, scale, 0.0)
+            prev_chunk_seq_idx = seq_idx_last
 
         
         # Decay the states and add the present final state, this is an ema update
         acc_states *= tl.exp2(dasum).to(acc_states.dtype)
-        acc_states += tl.dot(tl.trans(scale), x_block)
+        acc_states += tl.dot(tl.trans(scale[:, None]), x_block)
 
         # Optionally store accumulated states to global memory using TMA
         if STORE_STATES:
@@ -765,7 +765,7 @@ def test_ema_seqidx(
 
     # Test Triton implementation``
     print("\n=== Testing Triton Implementation ===")
-    out_triton = ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, chunk_size=chunk_size_triton, store_states=False)
+    out_triton = ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, seq_idx=Seq_idx, chunk_size=chunk_size_triton, store_states=False)
     out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
     out_ref = ema_torch_ref_seq_idx(einops.rearrange(X, "b s h d -> b s (h d)"), P, Seq_idx)
     out_ref_repeat = ema_torch_ref_repeat(einops.rearrange(X, "b s h d -> b s (h d)"), P, K=K)
@@ -854,4 +854,5 @@ if __name__ == "__main__":
         headdim_x=64,
         dtype=torch.float32,
         device="cuda",
+        K = 64,
     )
