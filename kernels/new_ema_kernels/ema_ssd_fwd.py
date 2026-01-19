@@ -227,18 +227,20 @@ def chunk_cumsum_triton(
 )
 @triton.jit
 def ema_fwd_kernel(
-    X, DA, DA_CS, DA_CS_REV, Out, States, 
+    X, DA, DA_CS, DA_CS_REV, Out, States, Seq_idx, 
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_dim,
     stride_da_batch, stride_da_head, stride_da_seqlen,
     stride_dacs_batch, stride_dacs_head, stride_dacs_seqlen,
     stride_dacsrev_batch, stride_dacsrev_head, stride_dacsrev_seqlen,
     stride_o_batch, stride_o_seqlen, stride_o_head, stride_o_dim,
     stride_s_batch, stride_s_chunk, stride_s_head, stride_s_hdim_bc, stride_s_hdim_x,
+    stride_seq_idx_batch, stride_seq_idx_seqlen,
     seqlen, headdim_bc, headdim_x, nheads_bc, batch, nheads,
     CHUNK_SIZE: tl.constexpr,
     # BLOCK_HEADDIM_BC: tl.constexpr,
     BLOCK_HEADDIM_X: tl.constexpr,
     STORE_STATES: tl.constexpr,
+    HAS_SEQ_IDX: tl.constexpr = False,
 ):
     """
     SSD forward kernel in Triton with TMA loads.
@@ -260,9 +262,15 @@ def ema_fwd_kernel(
     x_ptr = X + pid_batch * stride_x_batch + pid_head * stride_x_head
     o_ptr = Out + pid_batch * stride_o_batch + pid_head * stride_o_head
 
+    #TODO(kartiksrinivas): Recompute instead of load, remove head dim
+    # NOTE: We do not need a head dimension for this load, since its same across heads
+    # We can save on some ALU cycles
     da_ptr = DA + pid_batch * stride_da_batch + pid_head * stride_da_head
     dacs_ptr = DA_CS + pid_batch * stride_dacs_batch + pid_head * stride_dacs_head
     dacsrev_ptr = DA_CS_REV + pid_batch * stride_dacsrev_batch + pid_head * stride_dacsrev_head
+
+    if HAS_SEQ_IDX:
+        seq_idx_ptr = Seq_idx + pid_batch * stride_seq_idx_batch
 
     num_chunks = tl.cdiv(seqlen, CHUNK_SIZE)
 
@@ -282,6 +290,7 @@ def ema_fwd_kernel(
         block_shape=[CHUNK_SIZE, BLOCK_HEADDIM_X],
     )
 
+
     # Optionally create TMA descriptor for states
     if STORE_STATES:
         states_ptr = States + pid_batch * stride_s_batch + pid_head * stride_s_head
@@ -300,39 +309,64 @@ def ema_fwd_kernel(
 
     # tl.debug_barrier()
 
+    prev_chunk_seq_idx = -1 # stores the id of the previous chunk (register) 
+
     for chunk_idx in range(num_chunks):
         chunk_start = chunk_idx * CHUNK_SIZE
         offs_seqlen = chunk_start + tl.arange(0, CHUNK_SIZE)
 
         x_block = x_desc.load([chunk_start, 0])
         seqlen_mask = offs_seqlen < seqlen
+        
+
 
         # Load dA for current chunk: (CHUNK_SIZE,)
         da_chunk = tl.load(da_ptr + offs_seqlen * stride_da_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
         dacs_chunk = tl.load(dacs_ptr + offs_seqlen * stride_dacs_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
         dacsrev_chunk = tl.load(dacsrev_ptr + offs_seqlen * stride_dacsrev_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
+        if HAS_SEQ_IDX:
+            seq_idx_chunk = tl.load(seq_idx_ptr + offs_seqlen * stride_seq_idx_seqlen, mask=seqlen_mask, other=-1)
+            # seq_idx_mask = seq_idx_chunk == prev_chunk_seq_idx
 
         ##################################################################################################
         # Compute Output using cumulative states
         ##################################################################################################
 
-        # TODO(kartiksrinivas): Where are these things residing?
-
         #=================================
         # Use new start state of chunk
         # multiply with per-position decay
-        # TODO(kartiksrinivas): is using these adds the best way to broadcast?
+        # TODO(kartiksrinivas): Change to @aakash broadcast suggestion
         #=================================
   
         # O = (1, BLOCK_HEADDIM_X) + (CHUNK_SIZE, BLOCK_HEADDIM_X) = (CHUNK_SIZE, BLOCK_HEADDIM_X)
         acc_o = acc_states.to(tl.float32) + tl.zeros([CHUNK_SIZE, BLOCK_HEADDIM_X], tl.float32)
-        acc_o *= tl.exp2(dacs_chunk)[:, None] # Multiply with the decay
+        # acc_o *= tl.exp2(dacs_chunk)[:, None] # Multiply with the decay
+
+        #================================================
+        # Handle case with multiple sequences in the chunk
+        # Only the positions whose chunk id corresponds to 
+        # the final position of the prev chunk get the decay
+        #================================================
+        #TODO(kartiksrinivas): Look at the live range for scale, is this too much mem usage?
+        #NOTE: Handle case where sequence changes in chunk
+        if HAS_SEQ_IDX:
+            # scale = tl.where(seq_idx_mask, tl.exp2(dacs_chunk), 0.0)
+            scale = tl.where(seq_idx_chunk == prev_chunk_seq_idx, tl.exp2(dacs_chunk), 0.0)
+        else:
+            scale = tl.exp2(dacs_chunk)
+
+        # (CHUNK_SIZE, BLOCK_HEADDIM_X)
+        acc_o *= scale[:, None] # Multiply with the decay
 
         #=================================
         # Add the present chunk contribution to output
         #=================================
         # (CHUNK_SIZE, CHUNK_SIZE)
         s_block = tl.exp2(segsum_triton(da_chunk, CHUNK_SIZE))
+
+        # NOTE: multiply this by a (CHUNK_SIZE, CHUNK_SIZE) seqid mask
+        if HAS_SEQ_IDX:
+            s_block = tl.where(seq_idx_chunk[:, None] == seq_idx_chunk[None, :], s_block, 0.0)
         # O += causal(S) @ X: (CHUNK_SIZE, CHUNK_SIZE) @ (CHUNK_SIZE, headdim_x)
         acc_o += tl.dot(s_block.to(x_block.dtype), x_block)
         # Store output block
@@ -347,6 +381,17 @@ def ema_fwd_kernel(
         scale = tl.exp2(dacsrev_chunk[:, None]).to(x_block.dtype)
         # Scalar -- this is the TOTAL decay of the present chunk
         dasum = tl.load(dacs_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_dacs_seqlen).to(tl.float32)
+
+        #TODO(kartiksrinivas): Can you release the seq_idx_chunk register? Or should I recompute from SMEM
+        if HAS_SEQ_IDX:
+            # ! Why not load from seq_idx_chunk final position -- or do we free up registers?
+            seq_idx_last = tl.load(seq_idx_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_seq_idx_seqlen)
+            # dasum = tl.where(seq_idx_mask, dasum, 0.0) # its a scalar tho
+            dasum = tl.where(seq_idx_chunk == prev_chunk_seq_idx, dasum, 0.0) # its a scalar tho
+            prev_chunk_seq_idx = seq_idx_last
+            scale = tl.where(seq_idx_chunk == seq_idx_last, scale, 0.0)
+
+        
         # Decay the states and add the present final state, this is an ema update
         acc_states *= tl.exp2(dasum).to(acc_states.dtype)
         acc_states += tl.dot(tl.trans(scale), x_block)
@@ -356,6 +401,7 @@ def ema_fwd_kernel(
             # States shape: (batch, num_chunks, nheads, headdim_bc=1, headdim_x)
             states_block = tl.reshape(acc_states, [1, 1, BLOCK_HEADDIM_X])
             states_desc.store([chunk_idx, 0, 0], states_block)
+
 
 
 # TMA descriptors require a global memory allocation
