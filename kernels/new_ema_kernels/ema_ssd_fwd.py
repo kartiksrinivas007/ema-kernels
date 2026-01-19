@@ -418,6 +418,7 @@ def ema_fwd_triton(
     dA_cs: Optional[torch.Tensor] = None,  # (b, h, s) - chunk cumsum of dA
     dA_cs_rev: Optional[torch.Tensor] = None,  # (b, h, s) - reverse chunk cumsum of dA
     out: Optional[torch.Tensor] = None,  # (b, s, h, dx)
+    seq_idx: Optional[torch.Tensor] = None,  # (b, s)
     chunk_size: int = 64,
     store_states: bool = False,
 ):
@@ -467,7 +468,7 @@ def ema_fwd_triton(
         out = torch.empty_like(x)
     if store_states:
         states = torch.empty(batch, num_chunks, nheads, headdim_bc, headdim_x,
-                            dtype=torch.float32, device=c.device)
+                            dtype=torch.float32, device=x.device)
     else:
         states = None
 
@@ -482,7 +483,7 @@ def ema_fwd_triton(
 
 
     ema_fwd_kernel[grid](
-        x, dA, dA_cs, dA_cs_rev, out, states, 
+        x, dA, dA_cs, dA_cs_rev, out, states, seq_idx,
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         dA.stride(0), dA.stride(1), dA.stride(2),
         dA_cs.stride(0), dA_cs.stride(1), dA_cs.stride(2),
@@ -493,11 +494,14 @@ def ema_fwd_triton(
         states.stride(2) if store_states else 0,
         states.stride(3) if store_states else 0,
         states.stride(4) if store_states else 0,
+        seq_idx.stride(0) if seq_idx is not None else 0,
+        seq_idx.stride(1) if seq_idx is not None else 0,
         seqlen, headdim_bc, headdim_x, nheads_bc, batch, nheads, # headdim_bc  = 1
         CHUNK_SIZE=chunk_size,
         # BLOCK_HEADDIM_BC=BLOCK_HEADDIM_BC,
         BLOCK_HEADDIM_X=BLOCK_HEADDIM_X,
         STORE_STATES=store_states,
+        HAS_SEQ_IDX=seq_idx is not None,
     )
 
     if store_states:
@@ -530,8 +534,8 @@ def segsum(x):
 
 
 def ema_torch_ref(
-    X: torch.Tensor,
-    P: torch.Tensor
+    X: torch.Tensor, # (b, s, token_dim)
+    P: torch.Tensor # (b, s, 1)
 ):
     assert X.shape[0:2] == P.shape[0:2]
     
@@ -548,6 +552,73 @@ def ema_torch_ref(
 
     out = torch.stack(out, dim=1)  # (batch, seqlen, token_dim)
     return out
+
+def ema_torch_ref_seq_idx(
+    X: torch.Tensor, # (b, s, token_dim)
+    P: torch.Tensor, # (b, s, 1)
+    Seq_idx: torch.Tensor, # (b, s)
+):
+    assert X.shape[0:2] == P.shape[0:2]
+    prev_seq_idx = torch.zeros_like(Seq_idx[:, 0]) - 1  # (batch,)              
+    assert (prev_seq_idx == -1).all()
+    
+    seqlen = X.shape[1]
+
+    out = []
+    state = torch.zeros_like(X[:, 0, :])    # (batch, dim)
+
+
+    for t in range(seqlen):
+        x_t = X[:, t, :]    # (batch, dim)
+        p_t = P[:, t, :]    # (batch, 1)
+
+        # make mask for sequence change
+        seq_idx_t = Seq_idx[:, t]  # (batch,)
+        seq_is_constant = seq_idx_t == prev_seq_idx  # (batch,)         
+
+
+        # Update state accordingly
+        state = state * seq_is_constant.float()[:, None]  # reset state where sequence changes
+        state = state * (1 - p_t) + x_t
+
+        prev_seq_idx = seq_idx_t
+        out.append(state)
+
+    out = torch.stack(out, dim=1)  # (batch, seqlen, token_dim)
+    return out
+
+def ema_torch_ref_repeat(
+    X: torch.Tensor, # (b, s, token_dim)
+    P: torch.Tensor, # (b, s, 1)
+    K: int = 4
+):
+    assert X.shape[0:2] == P.shape[0:2]
+    
+    seqlen = X.shape[1]
+    per_seq_seqlen = seqlen // K
+
+    out = []
+    state = torch.zeros_like(X[:, 0, :])    # (batch, dim)
+
+
+    for ema_index in range(K):
+        state = torch.zeros_like(X[:, 0, :])    # (batch, dim)
+        for t in range(per_seq_seqlen * ema_index, per_seq_seqlen * ema_index + per_seq_seqlen):
+            x_t = X[:, t, :]    # (batch, dim)
+            p_t = P[:, t, :]    # (batch, 1)
+
+
+            # Update state accordingly
+            state = state * (1 - p_t) + x_t
+
+            out.append(state)
+
+    out = torch.stack(out, dim=1)  # (batch, seqlen, token_dim)
+    return out
+
+
+
+
 
 
 def test_ema(
@@ -653,10 +724,128 @@ def test_ema(
 
     gc.enable()
 
+def test_ema_seqidx(
+    batch=16,
+    seqlen=2048,
+    nheads=32,
+    nheads_bc=32,
+    headdim_bc=64,
+    headdim_x=64,
+    dtype=torch.bfloat16,
+    device="cuda",
+    K = 4,  # number of sequences we are stitching
+):
+    assert nheads % nheads_bc == 0
+    assert seqlen % K == 0, "seqlen must be multiple of 4 for this test"
+    # TODO(kartiksrinivas): how is this chunk size chosen and why?
+    chunk_size_triton = 64 
+
+    # Create input tensors
+    X = torch.randn(batch, seqlen, nheads, headdim_x, dtype=dtype, device=device)
+    O = torch.zeros_like(X, dtype=dtype, device=device)
+    #TODO(kartiksrinivas): You can repeat this for every head  -- do we need to do that though?
+    #TODO(kartiksrinivas): This is more memory consumption (but it makes things parallel)
+    #TODO(kartiksrinivas): Maybe can we use a TMA multicast to load the same value across multiple heads (programs?)
+    P = torch.rand(batch, seqlen, 1, dtype=dtype, device=device) 
+
+    # Build a K-fold arangement of sequences of even length
+    # with ids, 0, 1, 2 ... K - 1 each of len seqlen // K
+    seq_ids = torch.arange(K, device=device, dtype=torch.int8).repeat_interleave(seqlen // K)
+    Seq_idx = seq_ids.unsqueeze(0).repeat(batch, 1)
+
+    # breakpoint()
+
+    P_mamba = einops.repeat(P, 'b s 1 -> b s h', h=nheads)  
+    P_mamba = einops.rearrange(P_mamba , 'b s h -> b h s')
+    
+
+    dA = torch.log(1 - P_mamba) * math.log2(math.e)
+    dA_cs, dA_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size_triton)
+    
+
+    # Test Triton implementation``
+    print("\n=== Testing Triton Implementation ===")
+    out_triton = ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, chunk_size=chunk_size_triton, store_states=False)
+    out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
+    out_ref = ema_torch_ref_seq_idx(einops.rearrange(X, "b s h d -> b s (h d)"), P, Seq_idx)
+    out_ref_repeat = ema_torch_ref_repeat(einops.rearrange(X, "b s h d -> b s (h d)"), P, K=K)
+
+
+    print("\n=== Correctness ===")
+    print(f"Triton vs Ref f32, max diff = {(out_triton - out_ref).abs().max().item():.6f}, mean diff = {(out_triton - out_ref).abs().mean().item():.6f}")
+    print(f"Ref 32 vs Ref Repeat f32, max diff = {(out_ref - out_ref_repeat).abs().max().item():.6f}, mean diff = {(out_ref - out_ref_repeat).abs().mean().item():.6f}")
+    print(f"Triton 32 vs Ref Repeat f32, max diff = {(out_triton - out_ref_repeat).abs().max().item():.6f}, mean diff = {(out_triton - out_ref_repeat).abs().mean().item():.6f}")
+
+    breakpoint()
+
+
+    #############################################
+    # BENCHMARKING 
+    ############################################
+
+    from triton.testing import do_bench, do_bench_cudagraph
+    import time
+
+    # Disable GC for more consistent benchmarking
+    import gc
+    gc.collect()
+    gc.disable()
+
+    print("\n=== Benchmarking ===")
+
+    # Calculate memory I/O (without states)
+    dtype_size = X.element_size()  # bytes per element (2 for fp16/bf16)
+    # Read: C, B, X
+    num_bytes_read = (P_mamba.numel() + X.numel()) * dtype_size + Seq_idx.numel() * Seq_idx.element_size()
+    # Write: out
+    num_bytes_write = out_triton.numel() * dtype_size
+    num_io = num_bytes_read + num_bytes_write
+
+    # Calculate memory I/O with states
+    # States: (batch, num_chunks, nheads, headdim_bc, headdim_x) in float32 (4 bytes)
+    num_chunks = triton.cdiv(seqlen, 128)  # Assuming chunk_size=128
+    num_states_elements = batch * num_chunks * nheads * headdim_bc * headdim_x
+    num_bytes_states = num_states_elements * 4  # float32
+    num_io_with_states = num_io + num_bytes_states
+
+    print(f"Memory I/O (without states): {num_io / 1e9:.2f} GB (Read: {num_bytes_read / 1e9:.2f} GB, Write: {num_bytes_write / 1e9:.2f} GB)")
+    print(f"Memory I/O (with states):    {num_io_with_states / 1e9:.2f} GB (additional {num_bytes_states / 1e9:.2f} TB for states)")
+
+    # Make sure everything is contiguous for benchmarking
+    # can you write a loop to do this for all input tensors (loop, not manually doing each of them)
+    P_mamba = P_mamba.contiguous()
+    X = X.contiguous()
+    if dA is not None:
+        dA = dA.contiguous()
+        dA_cs = dA_cs.contiguous()
+        dA_cs_rev = dA_cs_rev.contiguous()
+
+    # Benchmark Triton (without states)
+    torch.cuda.synchronize()
+    #TODO(kartiksrinivas): Why is this sleep needed?
+    time.sleep(1.0)
+    fn = lambda: ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, chunk_size=chunk_size_triton, store_states=False)
+    t_triton = do_bench_cudagraph(fn, rep=30)
+    mem_bw_triton = num_io / t_triton / 1e9
+    print(f"Triton (no states): {t_triton:.3f} ms, {mem_bw_triton:.2f} TB/s")
+
+    # # Benchmark Triton (with states)
+    # torch.cuda.synchronize()
+    # time.sleep(1.0)
+    # t_triton_states = do_bench(lambda: ssd_fwd_triton(c, b, x, dt=dt, dA=dA, chunk_size=128, store_states=True), warmup=10, rep=30)
+    # mem_bw_triton_states = num_io_with_states / t_triton_states / 1e9
+    # print(f"Triton (with states): {t_triton_states:.3f} ms, {mem_bw_triton_states:.2f} TB/s")
+    # print(f"Overhead of storing states: {(t_triton_states - t_triton) / t_triton * 100:.1f}%")
+
+    # from flash_attn.cute.benchmark import pytorch_profiler
+    # pytorch_profiler(fn)
+
+    gc.enable()
+
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    test_ema(
+    test_ema_seqidx(
         batch=16,
         seqlen=2048,
         nheads=32,
