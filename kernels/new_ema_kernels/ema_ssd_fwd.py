@@ -219,7 +219,7 @@ def chunk_cumsum_triton(
 @triton.autotune(
      configs=[
         triton.Config({}, num_stages=s, num_warps=w, maxnreg=r)
-        for s in [2]
+        for s in [3]
         for w in [2]
         for r in [256]
     ],
@@ -227,11 +227,9 @@ def chunk_cumsum_triton(
 )
 @triton.jit
 def ema_fwd_kernel(
-    X, DA, DA_CS, DA_CS_REV, Out, States, Seq_idx, 
+    X, DA, Out, States, Seq_idx, 
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_dim,
     stride_da_batch, stride_da_head, stride_da_seqlen,
-    stride_dacs_batch, stride_dacs_head, stride_dacs_seqlen,
-    stride_dacsrev_batch, stride_dacsrev_head, stride_dacsrev_seqlen,
     stride_o_batch, stride_o_seqlen, stride_o_head, stride_o_dim,
     stride_s_batch, stride_s_chunk, stride_s_head, stride_s_hdim_bc, stride_s_hdim_x,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
@@ -266,8 +264,7 @@ def ema_fwd_kernel(
     # NOTE: We do not need a head dimension for this load, since its same across heads
     # We can save on some ALU cycles
     da_ptr = DA + pid_batch * stride_da_batch + pid_head * stride_da_head
-    dacs_ptr = DA_CS + pid_batch * stride_dacs_batch + pid_head * stride_dacs_head
-    dacsrev_ptr = DA_CS_REV + pid_batch * stride_dacsrev_batch + pid_head * stride_dacsrev_head
+
 
     if HAS_SEQ_IDX:
         seq_idx_ptr = Seq_idx + pid_batch * stride_seq_idx_batch
@@ -323,11 +320,15 @@ def ema_fwd_kernel(
 
         # Load dA for current chunk: (CHUNK_SIZE,)
         da_chunk = tl.load(da_ptr + offs_seqlen * stride_da_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
-        dacs_chunk = tl.load(dacs_ptr + offs_seqlen * stride_dacs_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
-        dacsrev_chunk = tl.load(dacsrev_ptr + offs_seqlen * stride_dacsrev_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
+
+        # TODO(kartiksrinivas): Do I do this before or after the seq_idx_chunk?
+        dacs_chunk = tl.cumsum(da_chunk)
+        dacs_last = tl.sum(da_chunk)
+        dacsrev_chunk = dacs_last - dacs_chunk
+
         if HAS_SEQ_IDX:
             seq_idx_chunk = tl.load(seq_idx_ptr + offs_seqlen * stride_seq_idx_seqlen, mask=seqlen_mask, other=-1)
-            # seq_idx_mask = seq_idx_chunk == prev_chunk_seq_idx
+            seq_idx_mask = seq_idx_chunk == prev_chunk_seq_idx
 
         ##################################################################################################
         # Compute Output using cumulative states
@@ -339,10 +340,6 @@ def ema_fwd_kernel(
         # TODO(kartiksrinivas): Change to @aakash broadcast suggestion
         #=================================
   
-        # O = (1, BLOCK_HEADDIM_X) + (CHUNK_SIZE, BLOCK_HEADDIM_X) = (CHUNK_SIZE, BLOCK_HEADDIM_X)
-        acc_o = acc_states.to(tl.float32) + tl.zeros([CHUNK_SIZE, BLOCK_HEADDIM_X], tl.float32)
-        # acc_o *= tl.exp2(dacs_chunk)[:, None] # Multiply with the decay
-
         #================================================
         # Handle case with multiple sequences in the chunk
         # Only the positions whose chunk id corresponds to 
@@ -351,13 +348,13 @@ def ema_fwd_kernel(
         #TODO(kartiksrinivas): Look at the live range for scale, is this too much mem usage?
         #NOTE: Handle case where sequence changes in chunk
         if HAS_SEQ_IDX:
-            # scale = tl.where(seq_idx_mask, tl.exp2(dacs_chunk), 0.0)
-            scale = tl.where(seq_idx_chunk == prev_chunk_seq_idx, tl.exp2(dacs_chunk), 0.0)
+            scale = tl.where(seq_idx_mask, tl.exp2(dacs_chunk), 0.0)
+            # scale = tl.where(seq_idx_chunk == prev_chunk_seq_idx, tl.exp2(dacs_chunk), 0.0)
         else:
             scale = tl.exp2(dacs_chunk)
 
         # (CHUNK_SIZE, BLOCK_HEADDIM_X)
-        acc_o *= scale[:, None] # Multiply with the decay
+        acc_o = acc_states * scale[:, None]
 
         #=================================
         # Add the present chunk contribution to output
@@ -380,20 +377,16 @@ def ema_fwd_kernel(
 
         # (CHUNK_SIZE, 1) -- This is the reverse (1 - p_2) 1 (last row per chunk)
         scale = tl.exp2(dacsrev_chunk).to(x_block.dtype)
-        # Scalar -- this is the TOTAL decay of the present chunk
-        dasum = tl.load(dacs_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_dacs_seqlen).to(tl.float32)
 
-        #TODO(kartiksrinivas): Can you release the seq_idx_chunk register? Or should I recompute from SMEM
         if HAS_SEQ_IDX:
-            # ! Why not load from seq_idx_chunk final position -- or do we free up registers?
             seq_idx_last = tl.load(seq_idx_ptr + min(chunk_start + CHUNK_SIZE - 1, seqlen - 1) * stride_seq_idx_seqlen)
-            acc_states = tl.where(seq_idx_last == prev_chunk_seq_idx, acc_states, 0.0) # its a scalar tho
+            acc_states = tl.where(seq_idx_mask, acc_states, 0.0) # its a scalar tho
             scale = tl.where(seq_idx_chunk == seq_idx_last, scale, 0.0)
             prev_chunk_seq_idx = seq_idx_last
 
         
         # Decay the states and add the present final state, this is an ema update
-        acc_states *= tl.exp2(dasum).to(acc_states.dtype)
+        acc_states *= tl.exp2(dacs_last).to(acc_states.dtype)
         acc_states += tl.dot(tl.trans(scale[:, None]), x_block)
 
         # Optionally store accumulated states to global memory using TMA
@@ -415,8 +408,6 @@ triton.set_allocator(alloc_fn)
 def ema_fwd_triton(
     x: torch.Tensor,  # (b, s, h, dx)
     dA: Optional[torch.Tensor] = None,  # (b, h, s)
-    dA_cs: Optional[torch.Tensor] = None,  # (b, h, s) - chunk cumsum of dA
-    dA_cs_rev: Optional[torch.Tensor] = None,  # (b, h, s) - reverse chunk cumsum of dA
     out: Optional[torch.Tensor] = None,  # (b, s, h, dx)
     seq_idx: Optional[torch.Tensor] = None,  # (b, s)
     chunk_size: int = 64,
@@ -451,12 +442,9 @@ def ema_fwd_triton(
             states: Accumulated states tensor (b, num_chunks, h, d, dx)
     """
     assert chunk_size in [64, 128]
-    assert dA is not None and dA_cs is not None and dA_cs_rev is not None
+    assert dA is not None 
     assert x.is_cuda, "Tensors must be on CUDA"
     assert dA.is_cuda, "dA tensor must be on CUDA"
-    assert dA_cs.is_cuda and dA_cs_rev.is_cuda, "dA_cs tensors must be on CUDA"
-    assert dA_cs.shape == dA.shape, "dA_cs must have same shape as dA"
-    assert dA_cs_rev.shape == dA.shape, "dA_cs_rev must have same shape as dA"
 
     batch, seqlen, nheads, headdim_x = x.shape
     # d_state is 1 since this is an EMA
@@ -483,11 +471,9 @@ def ema_fwd_triton(
 
 
     ema_fwd_kernel[grid](
-        x, dA, dA_cs, dA_cs_rev, out, states, seq_idx,
+        x, dA, out, states, seq_idx,
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         dA.stride(0), dA.stride(1), dA.stride(2),
-        dA_cs.stride(0), dA_cs.stride(1), dA_cs.stride(2),
-        dA_cs_rev.stride(0), dA_cs_rev.stride(1), dA_cs_rev.stride(2),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         states.stride(0) if store_states else 0,
         states.stride(1) if store_states else 0,
@@ -647,12 +633,11 @@ def test_ema(
     
 
     dA = torch.log(1 - P_mamba) * math.log2(math.e)
-    dA_cs, dA_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size_triton)
     
 
     # Test Triton implementation``
     print("\n=== Testing Triton Implementation ===")
-    out_triton = ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, chunk_size=chunk_size_triton, store_states=False)
+    out_triton = ema_fwd_triton(X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False)
     out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
     out_ref = ema_torch_ref(einops.rearrange(X, "b s h d -> b s (h d)"), P)
 
@@ -706,7 +691,7 @@ def test_ema(
     torch.cuda.synchronize()
     #TODO(kartiksrinivas): Why is this sleep needed?
     time.sleep(1.0)
-    fn = lambda: ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, chunk_size=chunk_size_triton, store_states=False)
+    fn = lambda: ema_fwd_triton(X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False)
     t_triton = do_bench_cudagraph(fn, rep=30)
     mem_bw_triton = num_io / t_triton / 1e9
     print(f"Triton (no states): {t_triton:.3f} ms, {mem_bw_triton:.2f} TB/s")
@@ -765,7 +750,7 @@ def test_ema_seqidx(
 
     # Test Triton implementation``
     print("\n=== Testing Triton Implementation ===")
-    out_triton = ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, seq_idx=Seq_idx, chunk_size=chunk_size_triton, store_states=False)
+    out_triton = ema_fwd_triton(X, dA=dA, out=None, seq_idx=Seq_idx, chunk_size=chunk_size_triton, store_states=False)
     out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
     out_ref = ema_torch_ref_seq_idx(einops.rearrange(X, "b s h d -> b s (h d)"), P, Seq_idx)
     out_ref_repeat = ema_torch_ref_repeat(einops.rearrange(X, "b s h d -> b s (h d)"), P, K=K)
@@ -776,7 +761,6 @@ def test_ema_seqidx(
     print(f"Ref 32 vs Ref Repeat f32, max diff = {(out_ref - out_ref_repeat).abs().max().item():.6f}, mean diff = {(out_ref - out_ref_repeat).abs().mean().item():.6f}")
     print(f"Triton 32 vs Ref Repeat f32, max diff = {(out_triton - out_ref_repeat).abs().max().item():.6f}, mean diff = {(out_triton - out_ref_repeat).abs().mean().item():.6f}")
 
-    breakpoint()
 
 
     #############################################
@@ -824,7 +808,7 @@ def test_ema_seqidx(
     torch.cuda.synchronize()
     #TODO(kartiksrinivas): Why is this sleep needed?
     time.sleep(1.0)
-    fn = lambda: ema_fwd_triton(X, dA=dA, dA_cs=dA_cs, dA_cs_rev=dA_cs_rev, out=None, chunk_size=chunk_size_triton, store_states=False)
+    fn = lambda: ema_fwd_triton(X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False)
     t_triton = do_bench_cudagraph(fn, rep=30)
     mem_bw_triton = num_io / t_triton / 1e9
     print(f"Triton (no states): {t_triton:.3f} ms, {mem_bw_triton:.2f} TB/s")
@@ -852,7 +836,7 @@ if __name__ == "__main__":
         nheads_bc=32, # unused anyways
         headdim_bc=1,
         headdim_x=64,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device="cuda",
         K = 64,
     )
