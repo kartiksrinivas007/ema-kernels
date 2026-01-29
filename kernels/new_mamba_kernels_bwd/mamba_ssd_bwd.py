@@ -222,7 +222,8 @@ def mamba3_bwd_kernel_dqkv(
     stride_qk_dot_batch, stride_qk_dot_head, stride_qk_dot_seqlen,
     # Strides for D: (nheads,)
     stride_d_head,
-    # Strides for SSM_States: (batch, nheads, HEADDIM_V, nchunks*HEADDIM_QK)
+    # Strides for SSM_States: (batch, nheads, HEADDIM_V, nchunks*HEADDIM_QK) 
+    # # NOTE(kartiksrinivas): squeezed numchunks, possibly done for optimized access (fastest moving dimension, is serially stored)
     stride_ssm_states_batch, stride_ssm_states_head, stride_ssm_states_vdim, stride_ssm_states_qkdim,
     # Strides for dO: (batch, seqlen, nheads, HEADDIM_V)
     stride_do_batch, stride_do_seqlen, stride_do_head, stride_do_vdim,
@@ -261,6 +262,7 @@ def mamba3_bwd_kernel_dqkv(
     Each program instance handles one (head, batch/seq) pair and iterates through
     all chunks in reverse order. This reverse iteration is necessary because
     state gradients flow backward through the sequence.
+    (this makes sense)
     
     The kernel computes:
         - dQ, dK: Gradients for query/key from both intra-chunk attention and inter-chunk states
@@ -357,7 +359,7 @@ def mamba3_bwd_kernel_dqkv(
         SSM_States + ssm_states_offset,
         shape=[HEADDIM_V, num_chunks * HEADDIM_QK],
         strides=[stride_ssm_states_vdim, stride_ssm_states_qkdim],
-        block_shape=[HEADDIM_V, HEADDIM_QK],
+        block_shape=[HEADDIM_V, HEADDIM_QK], # (head_dim, dstate)
     )
     do_desc = tl.make_tensor_descriptor(
         dO + do_offset,
@@ -391,6 +393,7 @@ def mamba3_bwd_kernel_dqkv(
         # ============================================================
         # Load Decay Values
         # We load these first to overlap computation with TMA loads
+        # NOTE(kartiksrinivas): These are LDG SM loads from DRAM to SM and synchronous
         # ============================================================
         da_cs_ptrs = DA_CS + da_cs_offset + (chunk_start + tl.arange(0, CHUNK_SIZE)) * stride_da_cs_seqlen
         da_cs = tl.load(da_cs_ptrs)  # Cumulative decay within chunk: (CHUNK_SIZE,)
@@ -416,12 +419,14 @@ def mamba3_bwd_kernel_dqkv(
         exp_da_cs = tl.math.exp2(da_cs)          # For scaling intra-chunk contributions
 
         # Compute causal mask with exponential decay (this is L^T)
+        #TODO(kartiksrinivas): Why was the mask computed before the tl.dot and not after it?
         if not RECOMPUTE_MASK:
             causal_decay_mask = tl.where(
                 tl.arange(0, CHUNK_SIZE)[None, :] >= tl.arange(0, CHUNK_SIZE)[:, None],
                 tl.math.exp2(tl.minimum(da_cs[None, :] - da_cs[:, None], 0.0)),
                 0.0
             )
+            # i, j element = da_cs[j] - da_cs[i]
 
         # ============================================================
         # Compute dADT Gradient (Part 1): From Intra-chunk Attention
