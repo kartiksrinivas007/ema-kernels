@@ -95,7 +95,7 @@ def test_compute_dpx_matches_autograd():
     device = driver.active.get_active_torch_device()  # type: ignore
 
     batch = 2
-    seqlen = 64
+    seqlen = 256
     nheads = 4
     headdim = 64
     chunk_size = 64

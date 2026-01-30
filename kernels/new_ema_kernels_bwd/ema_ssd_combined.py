@@ -9,10 +9,24 @@ Author: Kartik Srinivas
 
 from typing import Optional, Tuple
 
+import math
+
 import torch
 import triton
 
+from kernels.new_ema_kernels.ema_ssd_fwd import chunk_cumsum_triton, ema_fwd_triton
 from kernels.new_ema_kernels_bwd.ema_ssd_bwd import ema_ssd_bwd_kernel_dpx
+
+
+def _da_cs_sum(da_cs: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    # da_cs: (b, h, s) -> da_cs_sum: (b, h, nchunks)
+    seqlen = da_cs.shape[-1]
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    last_idx = torch.arange(nchunks, device=da_cs.device) * chunk_size + (chunk_size - 1)
+    last_idx = torch.clamp(last_idx, max=seqlen - 1)
+    gather_idx = last_idx.view(1, 1, nchunks).expand(da_cs.shape[0], da_cs.shape[1], nchunks)
+    return torch.gather(da_cs, dim=-1, index=gather_idx)
+
 
 #TODO(kartiksrinivas): is the da, da_cs_sum needed, or can we compute them on the fly instead,
 # This might improve the speed provided it does not cause too many local spills
@@ -145,3 +159,58 @@ def compute_dpx(
         dx[:, -1, :, :] += d_ox_state
 
     return dx, dA, d_issm_state
+
+
+class _EmaFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, A: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        # A is log(1 - P) in natural log space, shape (b, s)
+        if x.ndim != 4:
+            raise ValueError(f"x must be (batch, seqlen, nheads, head_dim), got {x.shape}")
+        if A.ndim != 2:
+            raise ValueError(f"A must be (batch, seqlen), got {A.shape}")
+
+        batch, seqlen, nheads, _ = x.shape
+        if A.shape != (batch, seqlen):
+            raise ValueError(f"A must be (batch, seqlen), got {A.shape}")
+
+        dA = (A * math.log2(math.e)).to(torch.float32) # this is the interesting thing here
+        dA = dA[:, None, :].repeat(1, nheads, 1).contiguous()
+        da_cs, _da_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size)
+        da_cs_sum = _da_cs_sum(da_cs, chunk_size=chunk_size)
+
+        out, states = ema_fwd_triton(x, dA=dA, out=None, chunk_size=chunk_size, store_states=True)
+        # Forward stores end-state; backward expects start-state per chunk.
+        ssm_states = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
+        ssm_states_shifted = torch.zeros_like(ssm_states)
+        ssm_states_shifted[:, :, :, 1:] = ssm_states[:, :, :, :-1]
+
+        ctx.chunk_size = chunk_size
+        ctx.save_for_backward(x, da_cs, da_cs_sum, ssm_states_shifted)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Optional[torch.Tensor] = None):
+        if grad_out is None:
+            return None, None, None
+
+        x, da_cs, da_cs_sum, ssm_states = ctx.saved_tensors
+        dx, dA_cs, _ = compute_dpx(
+            x,
+            da_cs,
+            da_cs_sum,
+            ssm_states,
+            grad_out,
+            d_ossm_state=None,
+            d_ox_state=None,
+            chunk_size=ctx.chunk_size,
+            has_input_state=False,
+        )
+
+        # Match test_ema_dpx behavior: sum per-head gradients directly.
+        dA_sum = dA_cs.sum(dim=1)
+        return dx, dA_sum, None
+
+
+def ema_combined(x: torch.Tensor, A: torch.Tensor, chunk_size: int = 64) -> torch.Tensor:
+    return _EmaFunction.apply(x, A, chunk_size)
