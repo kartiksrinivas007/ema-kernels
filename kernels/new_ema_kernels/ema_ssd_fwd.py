@@ -684,8 +684,6 @@ def test_ema(
     X = X.contiguous()
     if dA is not None:
         dA = dA.contiguous()
-        dA_cs = dA_cs.contiguous()
-        dA_cs_rev = dA_cs_rev.contiguous()
 
     # Benchmark Triton (without states)
     torch.cuda.synchronize()
