@@ -86,7 +86,7 @@ def compute_dpx(
     
     # Allocate output tensors
     dx = torch.empty_like(x)
-    dA = torch.empty_like(da_cs)
+    dA = torch.empty_like(da_cs) # is this usually float32?
     d_issm_state = (
         torch.empty((batch, nheads, head_dim, 1), dtype=torch.float32, device=x.device)
         if has_input_state
@@ -135,7 +135,7 @@ def compute_dpx(
         # Compile-time constants
         CHUNK_SIZE=chunk_size,
         HEAD_DIM=HEAD_DIM,
-        RECOMPUTE_MASK=False,
+        RECOMPUTE_MASK=True,
         HAS_D_OSSM_STATE=d_ossm_state is not None,
         RETURN_D_ISSM_STATE=has_input_state,
     )

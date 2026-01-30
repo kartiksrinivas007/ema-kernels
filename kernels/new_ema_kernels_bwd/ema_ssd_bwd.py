@@ -17,8 +17,9 @@ import triton.language as tl
 @triton.autotune(
     configs=[
         triton.Config({}, num_stages=s, num_warps=w)
-        for s in [1, 2, 3]
-        for w in [2, 4, 8]
+        # for s in [1, 2, 3]
+        for s in [3]
+        for w in [8]
     ],
     key=["CHUNK_SIZE", "HEAD_DIM"]
 )
@@ -134,14 +135,14 @@ def ema_ssd_bwd_kernel_dpx(
         strides=[stride_x_seqlen, stride_x_head_dim],
         block_shape=[CHUNK_SIZE, HEAD_DIM],
     )
-    #TODO(kartiksrinivas): Change this to use a standard tl.load since its now 1D
-    # and the advantages of the TMA pointer calculation might go away
-    ssm_states_desc = tl.make_tensor_descriptor(
-        SSM_States + ssm_states_offset,
-        shape=[HEAD_DIM, num_chunks],
-        strides=[stride_ssm_states_head_dim, stride_ssm_states_chunk],
-        block_shape=[HEAD_DIM, 1], # (head_dim, dstate)
-    )
+    # TODO(kartiksrinivas): Change this to use a standard tl.load since its now 1D.
+    # TMA requires the last block dimension to be >= 16 bytes.
+    # ssm_states_desc = tl.make_tensor_descriptor(
+    #     SSM_States + ssm_states_offset,
+    #     shape=[HEAD_DIM, num_chunks],
+    #     strides=[stride_ssm_states_head_dim, stride_ssm_states_chunk],
+    #     block_shape=[HEAD_DIM, 1], # (head_dim, dstate)
+    # )
     do_desc = tl.make_tensor_descriptor(
         dO + do_offset,
         shape=[seqlen, HEAD_DIM],
@@ -171,12 +172,21 @@ def ema_ssd_bwd_kernel_dpx(
         da_cs_sum_ptrs = DA_CS_SUM + da_cs_sum_offset + chunk_idx * stride_da_cs_sum_chunk
         da_cs_chunk_sum = tl.load(da_cs_sum_ptrs)  # Total decay for this chunk: scalar
 
+        # Load tl.load here to overlap with TMA
+        ssm_states_ptrs = (
+            SSM_States
+            + ssm_states_offset
+            + tl.arange(0, HEAD_DIM)[:, None] * stride_ssm_states_head_dim
+            + chunk_idx * stride_ssm_states_chunk
+        )
+        ssm_states_block = tl.load(ssm_states_ptrs)  # (HEAD_DIM, 1)
+
+
         # ============================================================
-        # Load Q, K, V, dO, SSM_States via TMA
+        # Load Q, K, V, dO via TMA
         # ============================================================
         do_block = do_desc.load([chunk_start, 0])  # (CHUNK_SIZE, HEADDIM_V)
         x_block = x_desc.load([chunk_start, 0])    # (CHUNK_SIZE, HEADDIM_V)
-        ssm_states_block = ssm_states_desc.load([0, chunk_idx])  # (HEADDIM_V, HEADDIM_QK)
 
         # ============================================================
         # Compute Decay Scaling Factors
@@ -208,7 +218,8 @@ def ema_ssd_bwd_kernel_dpx(
         if RECOMPUTE_MASK:
             dAinv *= tl.math.exp2(tl.minimum(da_cs[None, :] - da_cs[:, None], 0.0))
             dAinv = tl.where(
-                tl.arange(0, CHUNK_SIZE)[None, :] <= tl.arange(0, CHUNK_SIZE)[:, None],
+                # !NOTE :- I have changed this to be upper triangular to match above 
+                tl.arange(0, CHUNK_SIZE)[None, :] >= tl.arange(0, CHUNK_SIZE)[:, None],
                 dAinv,
                 0.0
                 #! NOTE(kartiksrinivas): But this has been made lower triangular, why??
@@ -402,4 +413,3 @@ def ema_ssd_bwd_kernel_dpx(
     #         d_ISSM_State + d_issm_state_offset + tl.arange(0, HEAD_DIM) * stride_d_issm_state_head_dim,
     #         d_ssm_states_acc[:, 0],
     #     )
-
