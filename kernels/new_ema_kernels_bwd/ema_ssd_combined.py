@@ -9,6 +9,8 @@ Author: Kartik Srinivas
 
 from kernels.new_ema_kernels_bwd.ema_ssd_bwd import ema_ssd_bwd_kernel_dpx 
 
+#TODO(kartiksrinivas): is the da, da_cs_sum needed, or can we compute them on the fly instead,
+# This might improve the speed provided it does not cause too many local spills
 def compute_dpx(
     x: torch.Tensor,
     da_cs: torch.Tensor,
@@ -59,7 +61,7 @@ def compute_dpx(
     assert SSM_States.shape == (batch, nheads, head_dim, nchunks), # dstate is 1, head_dim sized tensor 
     assert do.shape == (batch, seqlen, nheads, head_dim)
     assert d_ossm_state is None or d_ossm_state.shape == (batch, nheads, head_dim)
-    assert d_ov_state is None or d_ov_state.shape == (batch, nheads, head_dim)
+    assert d_ox_state is None or d_ox_state.shape == (batch, nheads, head_dim)
     
     # Ensure all tensors are contiguous for optimal memory access
     # Check if tensors have expected strides (innermost dimension stride = 1)
@@ -75,19 +77,18 @@ def compute_dpx(
         do = do.contiguous()
     if d_ossm_state is not None and d_ossm_state.stride(-1) != 1:
         d_ossm_state = d_ossm_state.contiguous()
-    if d_ov_state is not None and d_ov_state.stride(-1) != 1:
-        d_ov_state = d_ov_state.contiguous()
+    if d_ox_state is not None and d_ox_state.stride(-1) != 1:
+        d_ox_state = d_ox_state.contiguous()
     
     # Allocate output tensors
     dx = torch.empty_like(x)
-    dAdt = torch.empty_like(da_cs)
+    dA = torch.empty_like(da_cs)
     d_issm_state = torch.empty((batch, nheads, head_dim), dtype=torch.float32, device=q.device) if has_input_state else None # custom input states
     
     # Round up head dimensions to power of 2 for efficient loading
     # HEADDIM_QK = triton.next_power_of_2(headdim_qk) # 1 since next_pwoer_of_2(1) = 1
 
-    DSTATE = 1
-    HEAD_DIM = triton.next_power_of_2(headdim_v)
+    HEAD_DIM = triton.next_power_of_2(head_dim)
 
     
     # Grid: each program handles one (head, batch/num_sequences) pair
@@ -95,22 +96,14 @@ def compute_dpx(
     
     # Launch kernel
     ema_ssd_bwd_kernel_dpx[grid](
-        q, k, v, da_cs, da_cs_sum, qk_dot, D, SSM_States, do, d_ossm_state, Cu_Seqlen,
-        dq, dk, dv, dAdt, dQK, dD, d_issm_state,
-        # Q strides
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        # K strides
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        x, da_cs, da_cs_sum, SSM_States, do, d_ossm_state,
+        dx, dA, d_issm_state,
         # V strides
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         # DA_CS strides
         da_cs.stride(0), da_cs.stride(1), da_cs.stride(2),
         # DA_CS_SUM strides
         da_cs_sum.stride(0), da_cs_sum.stride(1), da_cs_sum.stride(2),
-        # QK_Dot strides
-        qk_dot.stride(0), qk_dot.stride(1), qk_dot.stride(2),
-        # D stride
-        D.stride(0) if D is not None else 0,
         # SSM_States strides: (batch, nheads, headdim_v, nchunks*headdim_qk)
         SSM_States.stride(0), SSM_States.stride(1), SSM_States.stride(2),
         SSM_States.stride(3),
@@ -121,21 +114,10 @@ def compute_dpx(
         d_ossm_state.stride(1) if d_ossm_state is not None else 0,
         d_ossm_state.stride(2) if d_ossm_state is not None else 0,
         d_ossm_state.stride(3) if d_ossm_state is not None else 0,
-        # Cu_Seqlen strides
-        Cu_Seqlen.stride(0) if Cu_Seqlen is not None else 0,
-        # dQ strides
-        dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
-        # dK strides
-        dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
-        # dV strides
-        dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+        # dX strides
+        dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3),
         # dAdt strides
-        dAdt.stride(0), dAdt.stride(1), dAdt.stride(2),
-        # dQK strides
-        dQK.stride(0), dQK.stride(1), dQK.stride(2),
-        # dD strides
-        dD.stride(0) if D is not None else 0,
-        dD.stride(1) if D is not None else 0,
+        dA.stride(0), dA.stride(1), dA.stride(2),
         # d_issm_state strides
         d_issm_state.stride(0) if d_issm_state is not None else 0,
         d_issm_state.stride(1) if d_issm_state is not None else 0,
@@ -145,18 +127,15 @@ def compute_dpx(
         seqlen, nheads_qk,
         # Compile-time constants
         CHUNK_SIZE=chunk_size,
-        DSTATE=1,
         HEADDIM_V=HEAD_DIM,
         RECOMPUTE_MASK=False,
         HAS_D_OSSM_STATE=d_ossm_state is not None,
         RETURN_D_ISSM_STATE=has_input_state,
-        HAS_VARLEN=has_varlen,
     )
 
     # Add output V state gradients to the last token
-    if d_ov_state is not None:
-        dv[:, -1, :, :] += d_ov_state
+    if d_ox_state is not None:
+        dx[:, -1, :, :] += d_ox_state
 
-    dD = dD.sum(dim=0) if dD is not None else None
-    return dq, dk, dv, dAdt, dQK, dD, d_issm_state
+    return dx, dA, d_issm_state
 
