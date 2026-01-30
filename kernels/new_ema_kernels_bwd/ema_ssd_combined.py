@@ -7,7 +7,12 @@ Copyright (c) 2025,  Goombalab
 Author: Kartik Srinivas
 """
 
-from kernels.new_ema_kernels_bwd.ema_ssd_bwd import ema_ssd_bwd_kernel_dpx 
+from typing import Optional, Tuple
+
+import torch
+import triton
+
+from kernels.new_ema_kernels_bwd.ema_ssd_bwd import ema_ssd_bwd_kernel_dpx
 
 #TODO(kartiksrinivas): is the da, da_cs_sum needed, or can we compute them on the fly instead,
 # This might improve the speed provided it does not cause too many local spills
@@ -21,7 +26,7 @@ def compute_dpx(
     d_ox_state: Optional[torch.Tensor] = None,
     chunk_size: int = 64,
     has_input_state: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Compute gradients dQ_mid, dK_mid, dV, dADT, dQK_dot, dD, d_issm_state for Mamba-3 backward pass.
     
@@ -43,8 +48,7 @@ def compute_dpx(
         has_input_state: Whether to compute gradient for input states
     
     Returns:
-        Tuple of (dQ_mid, dK_mid, dV, dADT, dQK_dot, dD, d_issm_state)
-        where d_issm_state is None if has_input_state=False
+        Tuple of (dx, dA, d_issm_state) where d_issm_state is None if has_input_state=False
     """
     batch, seqlen, nheads, head_dim = x.shape
     num_sequences = batch
@@ -58,15 +62,15 @@ def compute_dpx(
     assert da_cs.shape == (batch, nheads, seqlen) # nchunks * chunk_size
     assert da_cs_sum.shape == (batch, nheads, nchunks) # only the factors themselves
     #TODO(kartiksrinivas): How does changing this arrangement change the performance
-    assert SSM_States.shape == (batch, nheads, head_dim, nchunks), # dstate is 1, head_dim sized tensor 
+    assert SSM_States.shape == (batch, nheads, head_dim, nchunks)  # dstate is 1, head_dim sized tensor
     assert do.shape == (batch, seqlen, nheads, head_dim)
     assert d_ossm_state is None or d_ossm_state.shape == (batch, nheads, head_dim)
     assert d_ox_state is None or d_ox_state.shape == (batch, nheads, head_dim)
     
     # Ensure all tensors are contiguous for optimal memory access
     # Check if tensors have expected strides (innermost dimension stride = 1)
-    if v.stride(-1) != 1:
-        v = v.contiguous()
+    if x.stride(-1) != 1:
+        x = x.contiguous()
     if da_cs.stride(-1) != 1:
         da_cs = da_cs.contiguous()
     if da_cs_sum.stride(-1) != 1:
@@ -83,7 +87,11 @@ def compute_dpx(
     # Allocate output tensors
     dx = torch.empty_like(x)
     dA = torch.empty_like(da_cs)
-    d_issm_state = torch.empty((batch, nheads, head_dim), dtype=torch.float32, device=q.device) if has_input_state else None # custom input states
+    d_issm_state = (
+        torch.empty((batch, nheads, head_dim, 1), dtype=torch.float32, device=x.device)
+        if has_input_state
+        else None
+    )  # custom input states
     
     # Round up head dimensions to power of 2 for efficient loading
     # HEADDIM_QK = triton.next_power_of_2(headdim_qk) # 1 since next_pwoer_of_2(1) = 1
@@ -113,7 +121,6 @@ def compute_dpx(
         d_ossm_state.stride(0) if d_ossm_state is not None else 0,
         d_ossm_state.stride(1) if d_ossm_state is not None else 0,
         d_ossm_state.stride(2) if d_ossm_state is not None else 0,
-        d_ossm_state.stride(3) if d_ossm_state is not None else 0,
         # dX strides
         dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3),
         # dAdt strides
@@ -127,7 +134,7 @@ def compute_dpx(
         seqlen, nheads_qk,
         # Compile-time constants
         CHUNK_SIZE=chunk_size,
-        HEADDIM_V=HEAD_DIM,
+        HEAD_DIM=HEAD_DIM,
         RECOMPUTE_MASK=False,
         HAS_D_OSSM_STATE=d_ossm_state is not None,
         RETURN_D_ISSM_STATE=has_input_state,
@@ -138,4 +145,3 @@ def compute_dpx(
         dx[:, -1, :, :] += d_ox_state
 
     return dx, dA, d_issm_state
-
