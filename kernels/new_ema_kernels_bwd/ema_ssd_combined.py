@@ -177,9 +177,9 @@ class _EmaFunction(torch.autograd.Function):
         dA = (A * math.log2(math.e)).to(torch.float32) # this is the interesting thing here
         dA = dA[:, None, :].repeat(1, nheads, 1).contiguous()
         da_cs, _da_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size)
-        da_cs_sum = _da_cs_sum(da_cs, chunk_size=chunk_size)
-
-        out, states = ema_fwd_triton(x, dA=dA, out=None, chunk_size=chunk_size, store_states=True)
+        out, states, da_cs_sum = ema_fwd_triton(
+            x, dA=dA, out=None, chunk_size=chunk_size, store_states=True, store_da_cs_sum=True
+        )
         # Forward stores end-state; backward expects start-state per chunk.
         ssm_states = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
         ssm_states_shifted = torch.zeros_like(ssm_states)
@@ -195,7 +195,7 @@ class _EmaFunction(torch.autograd.Function):
             return None, None, None
 
         x, da_cs, da_cs_sum, ssm_states = ctx.saved_tensors
-        dx, dA_cs, _ = compute_dpx(
+        dx, dA, _ = compute_dpx(
             x,
             da_cs,
             da_cs_sum,
@@ -208,7 +208,7 @@ class _EmaFunction(torch.autograd.Function):
         )
 
         # Match test_ema_dpx behavior: sum per-head gradients directly.
-        dA_sum = dA_cs.sum(dim=1)
+        dA_sum = dA.sum(dim=1)
         return dx, dA_sum, None
 
 
