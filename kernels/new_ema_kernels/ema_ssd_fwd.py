@@ -203,6 +203,9 @@ def chunk_cumsum_triton(
         EXP2=exp2,
     )
     return dA_cs, dA_cs_rev
+
+#TODO(kartiksrinivas): Is it better to just write the outputs and gather the states later
+# or is it better to store them directly int the kernel?
 # -------------------------------------
 # OPTIMAL CONFIG float32:
 # -------------------------------------
@@ -372,6 +375,8 @@ def ema_fwd_kernel(
             s_block = tl.where(seq_idx_chunk[:, None] == seq_idx_chunk[None, :], s_block, 0.0)
         # O += causal(S) @ X: (CHUNK_SIZE, CHUNK_SIZE) @ (CHUNK_SIZE, headdim_x)
         acc_o += tl.dot(s_block.to(x_block.dtype), x_block)
+
+
         # Store output block
         o_desc.store([chunk_start, 0], acc_o.to(x_block.dtype))
 
@@ -657,7 +662,9 @@ def test_ema(
 
     # Test Triton implementation``
     print("\n=== Testing Triton Implementation ===")
-    out_triton = ema_fwd_triton(X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False)
+    out_triton, da_cs_sum = ema_fwd_triton(
+        X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False, store_da_cs_sum=True
+    )
     out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
     out_ref = ema_torch_ref(einops.rearrange(X, "b s h d -> b s (h d)"), P)
 
@@ -684,18 +691,27 @@ def test_ema(
     dtype_size = X.element_size()  # bytes per element (2 for fp16/bf16)
     # Read: C, B, X
     num_bytes_read = (P_mamba.numel() + X.numel()) * dtype_size
-    # Write: out
-    num_bytes_write = out_triton.numel() * dtype_size
+    # Write: out + da_cs_sum (float32)
+    num_bytes_out = out_triton.numel() * dtype_size
+    num_chunks = triton.cdiv(seqlen, chunk_size_triton)
+    # Float 32 accumulation for the da_cs_sum (additionally added)
+    num_bytes_da_cs_sum = batch * nheads * num_chunks * 4
+    num_bytes_write = num_bytes_out + num_bytes_da_cs_sum
     num_io = num_bytes_read + num_bytes_write
 
     # Calculate memory I/O with states
     # States: (batch, num_chunks, nheads, headdim_bc, headdim_x) in float32 (4 bytes)
-    num_chunks = triton.cdiv(seqlen, 128)  # Assuming chunk_size=128
+    # States: (batch, num_chunks, nheads, headdim_bc, headdim_x) in float32 (4 bytes)
     num_states_elements = batch * num_chunks * nheads * headdim_bc * headdim_x
     num_bytes_states = num_states_elements * 4  # float32
     num_io_with_states = num_io + num_bytes_states
 
-    print(f"Memory I/O (without states): {num_io / 1e9:.2f} GB (Read: {num_bytes_read / 1e9:.2f} GB, Write: {num_bytes_write / 1e9:.2f} GB)")
+    print(
+        f"Memory I/O (without states): {num_io / 1e9:.2f} GB "
+        f"(Read: {num_bytes_read / 1e9:.2f} GB, "
+        f"Write: {num_bytes_write / 1e9:.2f} GB "
+        f"[out: {num_bytes_out / 1e9:.2f} GB, da_cs_sum: {num_bytes_da_cs_sum / 1e9:.2f} GB])"
+    )
     print(f"Memory I/O (with states):    {num_io_with_states / 1e9:.2f} GB (additional {num_bytes_states / 1e9:.2f} TB for states)")
 
     # Make sure everything is contiguous for benchmarking
@@ -709,18 +725,26 @@ def test_ema(
     torch.cuda.synchronize()
     #TODO(kartiksrinivas): Why is this sleep needed?
     time.sleep(1.0)
-    fn = lambda: ema_fwd_triton(X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False)
+    fn = lambda: ema_fwd_triton(
+        X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False, store_da_cs_sum=True
+    )
     t_triton = do_bench_cudagraph(fn, rep=30)
     mem_bw_triton = num_io / t_triton / 1e9
     print(f"Triton (no states): {t_triton:.3f} ms, {mem_bw_triton:.2f} TB/s")
 
     # # Benchmark Triton (with states)
-    # torch.cuda.synchronize()
-    # time.sleep(1.0)
-    # t_triton_states = do_bench(lambda: ssd_fwd_triton(c, b, x, dt=dt, dA=dA, chunk_size=128, store_states=True), warmup=10, rep=30)
-    # mem_bw_triton_states = num_io_with_states / t_triton_states / 1e9
-    # print(f"Triton (with states): {t_triton_states:.3f} ms, {mem_bw_triton_states:.2f} TB/s")
-    # print(f"Overhead of storing states: {(t_triton_states - t_triton) / t_triton * 100:.1f}%")
+    torch.cuda.synchronize()
+    time.sleep(1.0)
+    t_triton_states = do_bench(
+        lambda: ema_fwd_triton(
+            X, dA=dA, chunk_size=chunk_size_triton, store_states=True, store_da_cs_sum=True
+        ),
+        warmup=10,
+        rep=30,
+    )
+    mem_bw_triton_states = num_io_with_states / t_triton_states / 1e9
+    print(f"Triton (with states): {t_triton_states:.3f} ms, {mem_bw_triton_states:.2f} TB/s")
+    print(f"Overhead of storing states: {(t_triton_states - t_triton) / t_triton * 100:.1f}%")
 
     # from flash_attn.cute.benchmark import pytorch_profiler
     # pytorch_profiler(fn)
@@ -768,7 +792,15 @@ def test_ema_seqidx(
 
     # Test Triton implementation``
     print("\n=== Testing Triton Implementation ===")
-    out_triton = ema_fwd_triton(X, dA=dA, out=None, seq_idx=Seq_idx, chunk_size=chunk_size_triton, store_states=False)
+    out_triton, da_cs_sum = ema_fwd_triton(
+        X,
+        dA=dA,
+        out=None,
+        seq_idx=Seq_idx,
+        chunk_size=chunk_size_triton,
+        store_states=False,
+        store_da_cs_sum=True,
+    )
     out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
     out_ref = ema_torch_ref_seq_idx(einops.rearrange(X, "b s h d -> b s (h d)"), P, Seq_idx)
     out_ref_repeat = ema_torch_ref_repeat(einops.rearrange(X, "b s h d -> b s (h d)"), P, K=K)
@@ -826,18 +858,26 @@ def test_ema_seqidx(
     torch.cuda.synchronize()
     #TODO(kartiksrinivas): Why is this sleep needed?
     time.sleep(1.0)
-    fn = lambda: ema_fwd_triton(X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False)
+    fn = lambda: ema_fwd_triton(
+        X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False, store_da_cs_sum=True
+    )
     t_triton = do_bench_cudagraph(fn, rep=30)
     mem_bw_triton = num_io / t_triton / 1e9
     print(f"Triton (no states): {t_triton:.3f} ms, {mem_bw_triton:.2f} TB/s")
 
     # # Benchmark Triton (with states)
-    # torch.cuda.synchronize()
-    # time.sleep(1.0)
-    # t_triton_states = do_bench(lambda: ssd_fwd_triton(c, b, x, dt=dt, dA=dA, chunk_size=128, store_states=True), warmup=10, rep=30)
-    # mem_bw_triton_states = num_io_with_states / t_triton_states / 1e9
-    # print(f"Triton (with states): {t_triton_states:.3f} ms, {mem_bw_triton_states:.2f} TB/s")
-    # print(f"Overhead of storing states: {(t_triton_states - t_triton) / t_triton * 100:.1f}%")
+    torch.cuda.synchronize()
+    time.sleep(1.0)
+    t_triton_states = do_bench(
+        lambda: ema_fwd_triton(
+            X, dA=dA, chunk_size=chunk_size_triton, store_states=True, store_da_cs_sum=True
+        ),
+        warmup=10,
+        rep=30,
+    )
+    mem_bw_triton_states = num_io_with_states / t_triton_states / 1e9
+    print(f"Triton (with states): {t_triton_states:.3f} ms, {mem_bw_triton_states:.2f} TB/s")
+    print(f"Overhead of storing states: {(t_triton_states - t_triton) / t_triton * 100:.1f}%")
 
     # from flash_attn.cute.benchmark import pytorch_profiler
     # pytorch_profiler(fn)
@@ -847,7 +887,7 @@ def test_ema_seqidx(
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    test_ema_seqidx(
+    test_ema(
         batch=16,
         seqlen=2048,
         nheads=32,
@@ -856,5 +896,4 @@ if __name__ == "__main__":
         headdim_x=64,
         dtype=torch.bfloat16,
         device="cuda",
-        K = 64,
     )
