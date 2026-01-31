@@ -5,6 +5,7 @@ import triton.runtime.driver as driver
 
 from kernels.new_ema_kernels.ema_ssd_fwd import ema_fwd_triton
 from kernels.new_ema_kernels_bwd.ema_ssd_combined import compute_dpx
+from kernels.tests.ema_ssd_bwd.test_utils import _compare_gradients
 
 
 def ema_loop(X: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
@@ -164,13 +165,9 @@ def test_compute_dpx_matches_autograd():
     # compute_dpx returns gradients w.r.t. dA (log2 space)
     # dA_ref_log2 = (dA_ref / math.log2(math.e)).to(dA_kernel.dtype)
 
-    dA_kernel_sum = dA_kernel.sum(dim=1).to(dA_ref.dtype)
-    dx_max = (dx_kernel - dx_ref).abs().max().item()
-    dx_mean = (dx_kernel - dx_ref).abs().mean().item()
-    dA_max = (dA_kernel_sum - dA_ref).abs().max().item()
-    dA_mean = (dA_kernel_sum - dA_ref).abs().mean().item()
-    print(f"dx diff: max = {dx_max:.6f}, mean = {dx_mean:.6f}")
-    print(f"dA diff: max = {dA_max:.6f}, mean = {dA_mean:.6f}")
+    dA_kernel_sum = dA_kernel.sum(dim=1)
+    _compare_gradients("dx", dx_kernel, dx_ref, chunk_size=chunk_size)
+    _compare_gradients("dA", dA_kernel_sum, dA_ref, chunk_size=chunk_size)
 
 
     #############################################

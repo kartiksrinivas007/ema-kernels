@@ -1,5 +1,18 @@
+from typing import Optional
+
+import torch
 import triton
 import triton.language as tl
+
+
+def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+try:
+    triton.set_allocator(alloc_fn)
+except Exception:
+    pass
 
 # Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, SGamma, Output_States = mamba3_fwd(
 #     Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, D, Z, Input_States,
@@ -18,8 +31,8 @@ import triton.language as tl
     configs=[
         triton.Config({}, num_stages=s, num_warps=w)
         # for s in [1, 2, 3]
-        for s in [3]
-        for w in [8]
+        for s in [1, 2, 3]
+        for w in [2, 4, 8]
     ],
     key=["CHUNK_SIZE", "HEAD_DIM"]
 )

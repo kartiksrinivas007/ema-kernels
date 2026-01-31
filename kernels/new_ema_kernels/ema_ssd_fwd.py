@@ -421,7 +421,10 @@ def alloc_fn(size: int, alignment: int, stream: Optional[int]):
     return torch.empty(size, device="cuda", dtype=torch.int8)
 
 
-triton.set_allocator(alloc_fn)
+try:
+    triton.set_allocator(alloc_fn)
+except Exception:
+    pass
 
 
 def ema_fwd_triton(

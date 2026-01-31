@@ -18,6 +18,16 @@ from kernels.new_ema_kernels.ema_ssd_fwd import chunk_cumsum_triton, ema_fwd_tri
 from kernels.new_ema_kernels_bwd.ema_ssd_bwd import ema_ssd_bwd_kernel_dpx
 
 
+def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+try:
+    triton.set_allocator(alloc_fn)
+except Exception:
+    pass
+
+
 def _da_cs_sum(da_cs: torch.Tensor, chunk_size: int) -> torch.Tensor:
     # da_cs: (b, h, s) -> da_cs_sum: (b, h, nchunks)
     seqlen = da_cs.shape[-1]

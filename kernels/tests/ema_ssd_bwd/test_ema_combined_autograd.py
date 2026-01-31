@@ -2,6 +2,7 @@ import torch
 import triton.runtime.driver as driver
 
 from kernels.new_ema_kernels_bwd.ema_ssd_combined import ema_combined
+from kernels.tests.ema_ssd_bwd.test_utils import _compare_gradients
 
 
 def ema_loop(X: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
@@ -26,9 +27,9 @@ def test_ema_combined_autograd():
     nheads = 4
     headdim = 64
     chunk_size = 64
-    dtype = torch.float32
+    dtype = torch.bfloat16
 
-    A = torch.rand(batch, seqlen, device=device, dtype=dtype)
+    A = torch.rand(batch, seqlen, device=device, dtype=torch.float32)
     A.neg_()
     A.requires_grad_()
     X = torch.randn(batch, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
@@ -50,5 +51,5 @@ def test_ema_combined_autograd():
     loss_ref = (out_ref * dout.reshape(batch, seqlen, nheads * headdim)).sum()
     loss_ref.backward()
 
-    assert torch.allclose(dx_kernel, X_ref.grad, atol=5e-2, rtol=5e-2)
-    assert torch.allclose(dA_kernel, A_ref.grad, atol=5e-2, rtol=5e-2)
+    _compare_gradients("dx", dx_kernel, X_ref.grad, chunk_size=chunk_size)
+    _compare_gradients("dA", dA_kernel, A_ref.grad, chunk_size=chunk_size)
