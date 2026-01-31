@@ -230,11 +230,12 @@ def chunk_cumsum_triton(
 )
 @triton.jit
 def ema_fwd_kernel(
-    X, DA, Out, States, DA_CS_SUM, Seq_idx,
+    X, DA, Out, States, DA_CS, DA_CS_SUM, Seq_idx,
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_dim,
     stride_da_batch, stride_da_head, stride_da_seqlen,
     stride_o_batch, stride_o_seqlen, stride_o_head, stride_o_dim,
     stride_s_batch, stride_s_chunk, stride_s_head, stride_s_hdim_bc, stride_s_hdim_x,
+    stride_da_cs_batch, stride_da_cs_head, stride_da_cs_seqlen,
     stride_da_cs_sum_batch, stride_da_cs_sum_head, stride_da_cs_sum_chunk,
     stride_seq_idx_batch, stride_seq_idx_seqlen,
     seqlen, headdim_bc, headdim_x, nheads_bc, batch, nheads,
@@ -242,6 +243,7 @@ def ema_fwd_kernel(
     # BLOCK_HEADDIM_BC: tl.constexpr,
     BLOCK_HEADDIM_X: tl.constexpr,
     STORE_STATES: tl.constexpr,
+    STORE_DA_CS: tl.constexpr,
     STORE_DA_CS_SUM: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr = False,
 ):
@@ -305,6 +307,8 @@ def ema_fwd_kernel(
             block_shape=[1, 1, BLOCK_HEADDIM_X],
         )
 
+    if STORE_DA_CS:
+        da_cs_ptr = DA_CS + pid_batch * stride_da_cs_batch + pid_head * stride_da_cs_head
     if STORE_DA_CS_SUM:
         da_cs_sum_ptr = DA_CS_SUM + pid_batch * stride_da_cs_sum_batch + pid_head * stride_da_cs_sum_head
 
@@ -333,6 +337,8 @@ def ema_fwd_kernel(
         dacs_chunk = tl.cumsum(da_chunk)
         dacs_last = tl.sum(da_chunk)
         dacsrev_chunk = dacs_last - dacs_chunk
+        if STORE_DA_CS:
+            tl.store(da_cs_ptr + offs_seqlen * stride_da_cs_seqlen, dacs_chunk, mask=seqlen_mask)
 
         if HAS_SEQ_IDX:
             seq_idx_chunk = tl.load(seq_idx_ptr + offs_seqlen * stride_seq_idx_seqlen, mask=seqlen_mask, other=-1)
@@ -425,6 +431,7 @@ def ema_fwd_triton(
     seq_idx: Optional[torch.Tensor] = None,  # (b, s)
     chunk_size: int = 64,
     store_states: bool = False,
+    store_da_cs: bool = False,
     store_da_cs_sum: bool = False,
 ):
     """Triton implementation of SSD forward pass with TMA
@@ -473,6 +480,10 @@ def ema_fwd_triton(
                             dtype=torch.float32, device=x.device)
     else:
         states = None
+    if store_da_cs:
+        da_cs = torch.empty(batch, nheads, seqlen, dtype=torch.float32, device=x.device)
+    else:
+        da_cs = None
     if store_da_cs_sum:
         da_cs_sum = torch.empty(batch, nheads, num_chunks, dtype=torch.float32, device=x.device)
     else:
@@ -489,7 +500,7 @@ def ema_fwd_triton(
 
 
     ema_fwd_kernel[grid](
-        x, dA, out, states, da_cs_sum, seq_idx,
+        x, dA, out, states, da_cs, da_cs_sum, seq_idx,
         x.stride(0), x.stride(1), x.stride(2), x.stride(3),
         dA.stride(0), dA.stride(1), dA.stride(2),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
@@ -498,6 +509,9 @@ def ema_fwd_triton(
         states.stride(2) if store_states else 0,
         states.stride(3) if store_states else 0,
         states.stride(4) if store_states else 0,
+        da_cs.stride(0) if store_da_cs else 0,
+        da_cs.stride(1) if store_da_cs else 0,
+        da_cs.stride(2) if store_da_cs else 0,
         da_cs_sum.stride(0) if store_da_cs_sum else 0,
         da_cs_sum.stride(1) if store_da_cs_sum else 0,
         da_cs_sum.stride(2) if store_da_cs_sum else 0,
@@ -508,14 +522,23 @@ def ema_fwd_triton(
         # BLOCK_HEADDIM_BC=BLOCK_HEADDIM_BC,
         BLOCK_HEADDIM_X=BLOCK_HEADDIM_X,
         STORE_STATES=store_states,
+        STORE_DA_CS=store_da_cs,
         STORE_DA_CS_SUM=store_da_cs_sum,
         HAS_SEQ_IDX=seq_idx is not None,
     )
 
+    if store_states and store_da_cs and store_da_cs_sum:
+        return out, states, da_cs, da_cs_sum
+    if store_states and store_da_cs:
+        return out, states, da_cs
     if store_states and store_da_cs_sum:
         return out, states, da_cs_sum
+    if store_da_cs and store_da_cs_sum:
+        return out, da_cs, da_cs_sum
     if store_states:
         return out, states
+    if store_da_cs:
+        return out, da_cs
     if store_da_cs_sum:
         return out, da_cs_sum
     return out
@@ -662,8 +685,8 @@ def test_ema(
 
     # Test Triton implementation``
     print("\n=== Testing Triton Implementation ===")
-    out_triton, da_cs_sum = ema_fwd_triton(
-        X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False, store_da_cs_sum=True
+    out_triton, da_cs, da_cs_sum = ema_fwd_triton(
+        X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False, store_da_cs=True, store_da_cs_sum=True
     )
     out_triton = einops.rearrange(out_triton, "b s h d -> b s (h d)")
     out_ref = ema_torch_ref(einops.rearrange(X, "b s h d -> b s (h d)"), P)
@@ -691,12 +714,13 @@ def test_ema(
     dtype_size = X.element_size()  # bytes per element (2 for fp16/bf16)
     # Read: C, B, X
     num_bytes_read = (P_mamba.numel() + X.numel()) * dtype_size
-    # Write: out + da_cs_sum (float32)
+    # Write: out + da_cs (float32) + da_cs_sum (float32)
     num_bytes_out = out_triton.numel() * dtype_size
     num_chunks = triton.cdiv(seqlen, chunk_size_triton)
     # Float 32 accumulation for the da_cs_sum (additionally added)
+    num_bytes_da_cs = batch * nheads * seqlen * 4
     num_bytes_da_cs_sum = batch * nheads * num_chunks * 4
-    num_bytes_write = num_bytes_out + num_bytes_da_cs_sum
+    num_bytes_write = num_bytes_out + num_bytes_da_cs + num_bytes_da_cs_sum
     num_io = num_bytes_read + num_bytes_write
 
     # Calculate memory I/O with states
@@ -710,7 +734,8 @@ def test_ema(
         f"Memory I/O (without states): {num_io / 1e9:.2f} GB "
         f"(Read: {num_bytes_read / 1e9:.2f} GB, "
         f"Write: {num_bytes_write / 1e9:.2f} GB "
-        f"[out: {num_bytes_out / 1e9:.2f} GB, da_cs_sum: {num_bytes_da_cs_sum / 1e9:.2f} GB])"
+        f"[out: {num_bytes_out / 1e9:.2f} GB, da_cs: {num_bytes_da_cs / 1e9:.2f} GB, "
+        f"da_cs_sum: {num_bytes_da_cs_sum / 1e9:.2f} GB])"
     )
     print(f"Memory I/O (with states):    {num_io_with_states / 1e9:.2f} GB (additional {num_bytes_states / 1e9:.2f} TB for states)")
 

@@ -174,11 +174,16 @@ class _EmaFunction(torch.autograd.Function):
         if A.shape != (batch, seqlen):
             raise ValueError(f"A must be (batch, seqlen), got {A.shape}")
 
-        dA = (A * math.log2(math.e)).to(torch.float32) # this is the interesting thing here
+        dA = (A * math.log2(math.e)).to(torch.float32)
         dA = dA[:, None, :].repeat(1, nheads, 1).contiguous()
-        da_cs, _da_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size)
-        out, states, da_cs_sum = ema_fwd_triton(
-            x, dA=dA, out=None, chunk_size=chunk_size, store_states=True, store_da_cs_sum=True
+        out, states, da_cs, da_cs_sum = ema_fwd_triton(
+            x,
+            dA=dA,
+            out=None,
+            chunk_size=chunk_size,
+            store_states=True,
+            store_da_cs=True,
+            store_da_cs_sum=True,
         )
         # Forward stores end-state; backward expects start-state per chunk.
         ssm_states = states.squeeze(3).permute(0, 2, 3, 1).contiguous()

@@ -3,7 +3,7 @@ import math
 import torch
 import triton.runtime.driver as driver
 
-from kernels.new_ema_kernels.ema_ssd_fwd import chunk_cumsum_triton, ema_fwd_triton
+from kernels.new_ema_kernels.ema_ssd_fwd import ema_fwd_triton
 from kernels.new_ema_kernels_bwd.ema_ssd_combined import compute_dpx
 
 
@@ -34,9 +34,9 @@ def _forward_matches_ema_loop():
     torch.manual_seed(0)
     device = driver.active.get_active_torch_device()  # type: ignore
 
-    batch = 2
-    seqlen = 256
-    nheads = 4
+    batch = 16
+    seqlen = 2048
+    nheads = 32
     headdim = 64
     chunk_size = 64
     dtype = torch.float32
@@ -99,7 +99,7 @@ def test_compute_dpx_matches_autograd():
     nheads = 4
     headdim = 64
     chunk_size = 64
-    dtype = torch.float32
+    dtype = torch.bfloat16
 
     A = torch.rand(batch, seqlen, device=device, dtype=dtype)
     A.neg_()
@@ -120,14 +120,19 @@ def test_compute_dpx_matches_autograd():
     P_mamba = P[:, :, None].repeat(1, 1, nheads).permute(0, 2, 1).contiguous()
     ## ! The conversion should ideally be done inside the kernel
     dA = (torch.log(1 - P_mamba) * math.log2(math.e)).to(torch.float32)
-    # (b , h,  s)
-    da_cs, _da_cs_rev = chunk_cumsum_triton(dA, chunk_size=chunk_size)
-    da_cs_sum = _da_cs_sum(da_cs, chunk_size=chunk_size)
 
     with torch.no_grad():
-        _out_triton, states = ema_fwd_triton(
-            X.detach(), dA=dA, out=None, chunk_size=chunk_size, store_states=True
+        _out_triton, states, da_cs, da_cs_sum = ema_fwd_triton(
+            X.detach(),
+            dA=dA,
+            out=None,
+            chunk_size=chunk_size,
+            store_states=True,
+            store_da_cs=True,
+            store_da_cs_sum=True,
         )
+        da_cs = da_cs.to(torch.float32)
+        da_cs_sum = da_cs_sum.to(torch.float32)
         ssm_states = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
         # Backward expects start-state per chunk; forward stores end-state.
         ssm_states_shifted = torch.zeros_like(ssm_states)
@@ -151,5 +156,60 @@ def test_compute_dpx_matches_autograd():
     # dA_ref_log2 = (dA_ref / math.log2(math.e)).to(dA_kernel.dtype)
 
     assert torch.allclose(dx_kernel, dx_ref, atol=5e-2, rtol=5e-2)
-    dA_kernel_sum = dA_kernel.sum(dim=1)
+    dA_kernel_sum = dA_kernel.sum(dim=1).to(dA_ref.dtype)
     assert torch.allclose(dA_kernel_sum, dA_ref, atol=5e-2, rtol=5e-2)
+
+
+    #############################################
+    # BENCHMARKING (compute_dpx only)
+    ############################################
+    from triton.testing import do_bench_cudagraph
+    import gc
+    import time
+
+    # Disable GC for more consistent benchmarking
+    gc.collect()
+    gc.disable()
+
+    # Calculate memory I/O for compute_dpx
+    # Read: x, da_cs, da_cs_sum, ssm_states_shifted, dout
+    # Write: dx, dA
+    num_bytes_read = (
+        x.numel() * x.element_size()
+        + da_cs.numel() * da_cs.element_size()
+        + da_cs_sum.numel() * da_cs_sum.element_size()
+        + ssm_states_shifted.numel() * ssm_states_shifted.element_size()
+        + dout.numel() * dout.element_size()
+    )
+    num_bytes_write = dx_kernel.numel() * dx_kernel.element_size() + dA_kernel.numel() * dA_kernel.element_size()
+    num_io = num_bytes_read + num_bytes_write
+
+    print("\n=== Backward Kernel Benchmarking (compute_dpx) ===")
+    print(
+        f"Memory I/O: {num_io / 1e9:.2f} GB "
+        f"(Read: {num_bytes_read / 1e9:.2f} GB, "
+        f"Write: {num_bytes_write / 1e9:.2f} GB)"
+    )
+
+    x_bench = X.detach()
+    dout_bench = dout.detach()
+
+    fn = lambda: compute_dpx(
+        x_bench,
+        da_cs,
+        da_cs_sum,
+        ssm_states_shifted,
+        dout_bench,
+        d_ossm_state=None,
+        d_ox_state=None,
+        chunk_size=chunk_size,
+        has_input_state=False,
+    )
+
+    torch.cuda.synchronize()
+    time.sleep(0.2)
+    t_ms = do_bench_cudagraph(fn, rep=30)
+    mem_bw = num_io / (t_ms * 1e-3) / 1e9
+    print(f"compute_dpx: {t_ms:.3f} ms, {mem_bw:.2f} GB/s")
+
+    gc.enable()
