@@ -1,8 +1,0 @@
-
-================= BENCHMARK RESULT =================
-[triton_matmul]   ms=8.598   GB/s=124.9487
-bytes moved = 1074.266 MB
-
-================= BENCHMARK RESULT =================
-[triton_matmul]   ms=2.387   GB/s=450.0351
-bytes moved = 1074.266 MB

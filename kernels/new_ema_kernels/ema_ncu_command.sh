@@ -1,1 +1,0 @@
-ncu --set full --replay-mode=kernel --target-processes=all --kernel-name-base=demangled --kernel-name "ema_fwd_kernel" --launch-skip 12 --launch-count 3 --export ema3_fwd_matmul_jan12_937p.ncu-rep --force-overwrite python ema_ssd_fwd.py

@@ -3,8 +3,8 @@ import math
 import torch
 import triton.runtime.driver as driver
 
-from kernels.new_ema_kernels.ema_ssd_fwd import ema_fwd_triton
-from kernels.new_ema_kernels_bwd.ema_ssd_combined import compute_dpx
+from kernels.forward.ema_ssd_fwd import ema_fwd_triton
+from kernels.backward.ema_ssd_combined import compute_dpx
 from kernels.tests.ema_ssd_bwd.test_utils import _compare_gradients
 
 

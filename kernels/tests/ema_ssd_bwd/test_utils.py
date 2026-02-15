@@ -247,6 +247,20 @@ def _compare_gradients(
     kernel_grad: torch.Tensor,
     ref_grad: torch.Tensor,
     chunk_size: int = 64,
+    p95_threshold: float = 6e-2,
+    ref_mask: float = 1e-3,
 ):
-    report_tensor_error(name, kernel_grad, ref_grad)
+    stats = report_tensor_error(
+        name,
+        kernel_grad,
+        ref_grad,
+        ref_mag_masks=(ref_mask,),
+    )
     report_chunkwise_error_1d(name, kernel_grad, ref_grad, chunk_size=chunk_size)
+
+    p95_key = f"masked_{ref_mask}_p95_rel"
+    p95 = stats.get(p95_key, None)
+    assert p95 is not None, f"{name}: missing p95 (mask={ref_mask})"
+    assert p95 <= p95_threshold, (
+        f"{name}: p95 rel error {p95:.6e} exceeds threshold {p95_threshold:.6e}"
+    )

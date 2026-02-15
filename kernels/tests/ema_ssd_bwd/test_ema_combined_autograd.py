@@ -1,7 +1,7 @@
 import torch
 import triton.runtime.driver as driver
 
-from kernels.new_ema_kernels_bwd.ema_ssd_combined import ema_combined
+from kernels.backward.ema_ssd_combined import ema_combined
 from kernels.tests.ema_ssd_bwd.test_utils import _compare_gradients
 
 
@@ -22,9 +22,9 @@ def test_ema_combined_autograd():
     torch.manual_seed(0)
     device = driver.active.get_active_torch_device()  # type: ignore
 
-    batch = 2
-    seqlen = 256
-    nheads = 4
+    batch = 16
+    seqlen = 2048
+    nheads = 32
     headdim = 64
     chunk_size = 64
     dtype = torch.bfloat16

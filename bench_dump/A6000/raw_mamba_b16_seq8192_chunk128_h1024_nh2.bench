@@ -1,8 +1,0 @@
-
-================= BENCHMARK RESULT =================
-[mamba]   ms=2.803   GB/s=383.2169
-bytes moved = 1074.266 MB
-
-================= BENCHMARK RESULT =================
-[mamba]   ms=2.816   GB/s=381.5492
-bytes moved = 1074.266 MB

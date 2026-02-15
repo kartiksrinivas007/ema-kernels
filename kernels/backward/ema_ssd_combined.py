@@ -1,0 +1,231 @@
+"""Ema Triton Autograd Wrapper
+
+Interface for EMA kernels with automatic differentiation
+
+Copyright (c) 2025,  Goombalab
+
+Author: Kartik Srinivas
+"""
+
+from typing import Optional, Tuple
+
+import math
+
+import torch
+import triton
+import triton.runtime._allocation as _triton_alloc
+
+from kernels.forward.ema_ssd_fwd import chunk_cumsum_triton, ema_fwd_triton
+from kernels.backward.ema_ssd_bwd import ema_ssd_bwd_kernel_dpx
+
+
+def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+def _set_triton_allocator():
+    triton.set_allocator(alloc_fn)
+    if hasattr(_triton_alloc, "set_allocator"):
+        _triton_alloc.set_allocator(alloc_fn)
+    else:
+        _triton_alloc._allocator = alloc_fn
+
+
+_set_triton_allocator()
+
+
+def _da_cs_sum(da_cs: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    # da_cs: (b, h, s) -> da_cs_sum: (b, h, nchunks)
+    seqlen = da_cs.shape[-1]
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    last_idx = torch.arange(nchunks, device=da_cs.device) * chunk_size + (chunk_size - 1)
+    last_idx = torch.clamp(last_idx, max=seqlen - 1)
+    gather_idx = last_idx.view(1, 1, nchunks).expand(da_cs.shape[0], da_cs.shape[1], nchunks)
+    return torch.gather(da_cs, dim=-1, index=gather_idx)
+
+
+# da_cs and da_cs_sum are currently materialized to keep kernel math simple
+# and avoid register pressure from recomputation.
+def compute_dpx(
+    x: torch.Tensor,
+    da_cs: torch.Tensor,
+    da_cs_sum: torch.Tensor,
+    SSM_States: torch.Tensor,
+    do: torch.Tensor,
+    d_ossm_state: Optional[torch.Tensor] = None,
+    d_ox_state: Optional[torch.Tensor] = None,
+    chunk_size: int = 64,
+    has_input_state: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    EMA backward wrapper that launches the Triton kernel for dX and dA.
+
+    Args:
+        x: Input tensor (batch, seqlen, nheads, head_dim)
+        da_cs: Per-token cumulative dA within each chunk (batch, nheads, seqlen)
+        da_cs_sum: Per-chunk sum of dA (batch, nheads, nchunks)
+        SSM_States: Per-chunk start states from forward (batch, nheads, head_dim, nchunks)
+        do: Output gradient (batch, seqlen, nheads, head_dim)
+        d_ossm_state: Optional gradient of output state (batch, nheads, head_dim)
+        d_ox_state: Optional gradient added to last token (batch, nheads, head_dim)
+        chunk_size: Chunk size (default: 64)
+        has_input_state: Whether to return gradient for input states
+
+    Returns:
+        (dx, dA, d_issm_state) where d_issm_state is None if has_input_state=False.
+    """
+    # Shapes and derived sizes
+    batch, seqlen, nheads, head_dim = x.shape
+    # NOTE(kartiksrinivas): Does choosing a single head make this far easier?
+    nheads_qk = nheads # same number of heads for now
+
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    assert x.is_cuda and da_cs.is_cuda and da_cs_sum.is_cuda and do.is_cuda, "All tensors must be on CUDA"
+
+    #TODO(kartiksrinivas): These are being provided and not computed (possibly to avoid spills?)
+    assert da_cs.shape == (batch, nheads, seqlen) # nchunks * chunk_size
+    assert da_cs_sum.shape == (batch, nheads, nchunks) # only the factors themselves
+    #TODO(kartiksrinivas): How does changing this arrangement change the performance
+    assert SSM_States.shape == (batch, nheads, head_dim, nchunks)  # dstate is 1, head_dim sized tensor
+    assert do.shape == (batch, seqlen, nheads, head_dim)
+    assert d_ossm_state is None or d_ossm_state.shape == (batch, nheads, head_dim)
+    assert d_ox_state is None or d_ox_state.shape == (batch, nheads, head_dim)
+    
+    # Ensure all tensors are contiguous for optimal memory access
+    # (innermost dimension stride = 1)
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if da_cs.stride(-1) != 1:
+        da_cs = da_cs.contiguous()
+    if da_cs_sum.stride(-1) != 1:
+        da_cs_sum = da_cs_sum.contiguous()
+    if SSM_States.stride(-1) != 1:
+        SSM_States = SSM_States.contiguous()
+    if do.stride(-1) != 1:
+        do = do.contiguous()
+    if d_ossm_state is not None and d_ossm_state.stride(-1) != 1:
+        d_ossm_state = d_ossm_state.contiguous()
+    if d_ox_state is not None and d_ox_state.stride(-1) != 1:
+        d_ox_state = d_ox_state.contiguous()
+    
+    # Ensure allocator is set for TMA scratch
+    _set_triton_allocator()
+
+    # Allocate output tensors
+    dx = torch.empty_like(x)
+    dA = torch.empty_like(da_cs) # is this usually float32?
+    d_issm_state = (
+        torch.empty((batch, nheads, head_dim, 1), dtype=torch.float32, device=x.device)
+        if has_input_state
+        else None
+    )  # custom input states
+    
+    # Round up head dimensions to power of 2 for efficient loading
+    HEAD_DIM = triton.next_power_of_2(head_dim)
+
+    
+    # Grid: each program handles one (head, batch) pair
+    grid = (nheads, batch)
+    
+    # Launch kernel
+    ema_ssd_bwd_kernel_dpx[grid](
+        x, da_cs, da_cs_sum, SSM_States, do, d_ossm_state,
+        dx, dA, d_issm_state,
+        # V strides
+        x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+        # DA_CS strides
+        da_cs.stride(0), da_cs.stride(1), da_cs.stride(2),
+        # DA_CS_SUM strides
+        da_cs_sum.stride(0), da_cs_sum.stride(1), da_cs_sum.stride(2),
+        # SSM_States strides: (batch, nheads, headdim_v, nchunks*headdim_qk)
+        SSM_States.stride(0), SSM_States.stride(1), SSM_States.stride(2),
+        SSM_States.stride(3),
+        # dO strides
+        do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+        # d_ossm_state strides
+        d_ossm_state.stride(0) if d_ossm_state is not None else 0,
+        d_ossm_state.stride(1) if d_ossm_state is not None else 0,
+        d_ossm_state.stride(2) if d_ossm_state is not None else 0,
+        # dX strides
+        dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3),
+        # dAdt strides
+        dA.stride(0), dA.stride(1), dA.stride(2),
+        # d_issm_state strides
+        d_issm_state.stride(0) if d_issm_state is not None else 0,
+        d_issm_state.stride(1) if d_issm_state is not None else 0,
+        d_issm_state.stride(2) if d_issm_state is not None else 0,
+        d_issm_state.stride(3) if d_issm_state is not None else 0,
+        # Dimensions
+        seqlen, nheads_qk,
+        # Compile-time constants
+        CHUNK_SIZE=chunk_size,
+        HEAD_DIM=HEAD_DIM,
+        RECOMPUTE_MASK=True,
+        HAS_D_OSSM_STATE=d_ossm_state is not None,
+        RETURN_D_ISSM_STATE=has_input_state,
+    )
+
+    # Add output V state gradients to the last token
+    if d_ox_state is not None:
+        dx[:, -1, :, :] += d_ox_state
+
+    return dx, dA, d_issm_state
+
+
+class _EmaFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, A: torch.Tensor, chunk_size: int) -> torch.Tensor:
+        # A is log(1 - P) in natural log space, shape (b, s)
+        if x.ndim != 4:
+            raise ValueError(f"x must be (batch, seqlen, nheads, head_dim), got {x.shape}")
+        if A.ndim != 2:
+            raise ValueError(f"A must be (batch, seqlen), got {A.shape}")
+
+        batch, seqlen, nheads, _ = x.shape
+        if A.shape != (batch, seqlen):
+            raise ValueError(f"A must be (batch, seqlen), got {A.shape}")
+
+        # Convert to log2 decay and expand across heads
+        dA = (A * math.log2(math.e)).to(torch.float32)
+        dA = dA[:, None, :].repeat(1, nheads, 1).contiguous()
+        out, states, da_cs, da_cs_sum = ema_fwd_triton(
+            x,
+            dA=dA,
+            out=None,
+            chunk_size=chunk_size,
+            store_states=True,
+            store_da_cs=True,
+            store_da_cs_sum=True,
+        )
+        # Forward stores start-state per chunk.
+        ssm_states_shifted = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
+
+        ctx.chunk_size = chunk_size
+        ctx.save_for_backward(x, da_cs, da_cs_sum, ssm_states_shifted)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Optional[torch.Tensor] = None):
+        if grad_out is None:
+            return None, None, None
+
+        x, da_cs, da_cs_sum, ssm_states = ctx.saved_tensors
+        # Backward: compute gradients w.r.t. X and dA (log2 space)
+        dx, dA, _ = compute_dpx(
+            x,
+            da_cs,
+            da_cs_sum,
+            ssm_states,
+            grad_out,
+            d_ossm_state=None,
+            d_ox_state=None,
+            chunk_size=ctx.chunk_size,
+            has_input_state=False,
+        )
+
+        # Match test_ema_dpx behavior: sum per-head gradients directly.
+        dA_sum = dA.sum(dim=1)
+        return dx, dA_sum, None
+
+
+def ema_combined(x: torch.Tensor, A: torch.Tensor, chunk_size: int = 64) -> torch.Tensor:
+    return _EmaFunction.apply(x, A, chunk_size)

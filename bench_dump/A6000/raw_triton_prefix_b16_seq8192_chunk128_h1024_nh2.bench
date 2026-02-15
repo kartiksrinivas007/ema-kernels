@@ -1,8 +1,0 @@
-
-================= BENCHMARK RESULT =================
-[triton_prefix]   ms=5.243   GB/s=204.9040
-bytes moved = 1074.266 MB
-
-================= BENCHMARK RESULT =================
-[triton_prefix]   ms=5.245   GB/s=204.8280
-bytes moved = 1074.266 MB

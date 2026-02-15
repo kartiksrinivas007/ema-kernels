@@ -23,7 +23,7 @@ def _set_triton_allocator():
 _set_triton_allocator()
 
 
-from kernels.new_ema_kernels_bwd.ema_ssd_combined import ema_combined
+from kernels.backward.ema_ssd_combined import ema_combined
 
 
 def bench_total(
