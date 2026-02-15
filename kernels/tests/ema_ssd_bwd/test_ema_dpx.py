@@ -86,16 +86,20 @@ def _states_shape_and_values():
     num_chunks = (seqlen + chunk_size - 1) // chunk_size
     print(f"States shape: {states.shape} (expected {(batch, num_chunks, nheads, 1, headdim)})")
 
-    # For EMA, the state at each chunk matches the output at the last token of that chunk.
+    # Forward now stores start-state per chunk:
+    # chunk 0 start state is zeros; chunk k>0 start state equals output at last token of chunk k-1.
     last_idx = torch.arange(num_chunks, device=device) * chunk_size + (chunk_size - 1)
     last_idx = torch.clamp(last_idx, max=seqlen - 1)
     out_last = out_triton[:, last_idx, :, :]  # (b, num_chunks, h, d)
     states_squeezed = states[:, :, :, 0, :]
+    start_ref = torch.zeros_like(states_squeezed)
+    if num_chunks > 1:
+        start_ref[:, 1:, :, :] = out_last[:, :-1, :, :]
 
-    max_diff = (states_squeezed - out_last.to(states_squeezed.dtype)).abs().max().item()
-    mean_diff = (states_squeezed - out_last.to(states_squeezed.dtype)).abs().mean().item()
+    max_diff = (states_squeezed - start_ref.to(states_squeezed.dtype)).abs().max().item()
+    mean_diff = (states_squeezed - start_ref.to(states_squeezed.dtype)).abs().mean().item()
     print(
-        f"States vs out_last: max diff = {max_diff:.6f}, mean diff = {mean_diff:.6f}"
+        f"States vs start_ref: max diff = {max_diff:.6f}, mean diff = {mean_diff:.6f}"
     )
 
 
@@ -110,7 +114,7 @@ def test_compute_dpx_matches_autograd():
     chunk_size = 64
     dtype = torch.bfloat16
 
-    A = torch.rand(batch, seqlen, device=device, dtype=dtype)
+    A = torch.rand(batch, seqlen, device=device, dtype=torch.float32)
     A.neg_()
     A.requires_grad_()
     X = torch.randn(batch, seqlen, nheads, headdim, device=device, dtype=dtype, requires_grad=True)
@@ -128,7 +132,6 @@ def test_compute_dpx_matches_autograd():
 
     # (b, h, s)
     P_mamba = P[:, :, None].repeat(1, 1, nheads).permute(0, 2, 1).contiguous()
-    ## ! The conversion should ideally be done inside the kernel
     dA = (torch.log(1 - P_mamba) * math.log2(math.e)).to(torch.float32)
 
     with torch.no_grad():
@@ -143,10 +146,8 @@ def test_compute_dpx_matches_autograd():
         )
         da_cs = da_cs.to(torch.float32)
         da_cs_sum = da_cs_sum.to(torch.float32)
-        ssm_states = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
-        # Backward expects start-state per chunk; forward stores end-state.
-        ssm_states_shifted = torch.zeros_like(ssm_states)
-        ssm_states_shifted[:, :, :, 1:] = ssm_states[:, :, :, :-1]
+        # Forward now stores start-state per chunk.
+        ssm_states_shifted = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
         dx_kernel, dA_kernel, _ = compute_dpx(
             X.detach(),
             da_cs,

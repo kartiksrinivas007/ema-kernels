@@ -195,10 +195,8 @@ class _EmaFunction(torch.autograd.Function):
             store_da_cs=True,
             store_da_cs_sum=True,
         )
-        # Forward stores end-state; backward expects start-state per chunk.
-        ssm_states = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
-        ssm_states_shifted = torch.zeros_like(ssm_states)
-        ssm_states_shifted[:, :, :, 1:] = ssm_states[:, :, :, :-1]
+        # Forward now stores start-state per chunk.
+        ssm_states_shifted = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
 
         ctx.chunk_size = chunk_size
         ctx.save_for_backward(x, da_cs, da_cs_sum, ssm_states_shifted)

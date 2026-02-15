@@ -387,6 +387,13 @@ def ema_fwd_kernel(
         o_desc.store([chunk_start, 0], acc_o.to(x_block.dtype))
 
 
+        # Optionally store accumulated states to global memory using TMA
+        # Store the start-state of the chunk (before update).
+        if STORE_STATES:
+            # States shape: (batch, num_chunks, nheads, headdim_bc=1, headdim_x)
+            states_block = tl.reshape(acc_states, [1, 1, BLOCK_HEADDIM_X])
+            states_desc.store([chunk_idx, 0, 0], states_block)
+
         ##################################################################################################
         # Update cumulative states
         ##################################################################################################
@@ -400,19 +407,12 @@ def ema_fwd_kernel(
             scale = tl.where(seq_idx_chunk == seq_idx_last, scale, 0.0)
             prev_chunk_seq_idx = seq_idx_last
 
-        
         # Decay the states and add the present final state, this is an ema update
         acc_states *= tl.exp2(dacs_last).to(acc_states.dtype)
         acc_states += tl.dot(tl.trans(scale[:, None]), x_block)
 
         if STORE_DA_CS_SUM:
             tl.store(da_cs_sum_ptr + chunk_idx * stride_da_cs_sum_chunk, dacs_last)
-
-        # Optionally store accumulated states to global memory using TMA
-        if STORE_STATES:
-            # States shape: (batch, num_chunks, nheads, headdim_bc=1, headdim_x)
-            states_block = tl.reshape(acc_states, [1, 1, BLOCK_HEADDIM_X])
-            states_desc.store([chunk_idx, 0, 0], states_block)
 
 
 
