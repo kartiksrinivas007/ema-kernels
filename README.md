@@ -1,5 +1,18 @@
 ## Triton Kernels
 
+### EMA (Triton) quick commands
+
+Forward/backward correctness tests (EMA Triton):
+```
+python -m pytest -v -s kernels/tests/ema_ssd_bwd/test_ema_dpx.py
+python -m pytest -v -s kernels/tests/ema_ssd_bwd/test_ema_combined_autograd.py
+```
+
+Total EMA benchmark (Triton fwd+bwd vs Mamba-2 forward + bwd):
+```
+python -m kernels.tests.ema_ssd_bwd.bench_ema_total
+```
+
 ---
 The directory structure is as follows `kernels` is the head level module
 ```
@@ -69,4 +82,3 @@ To run older tests on basic kernels.
 ```
 python -m pytest -v kernels/tests/test_basic.py
 ```
-

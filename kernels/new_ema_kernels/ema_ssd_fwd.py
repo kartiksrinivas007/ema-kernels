@@ -204,8 +204,6 @@ def chunk_cumsum_triton(
     )
     return dA_cs, dA_cs_rev
 
-#TODO(kartiksrinivas): Is it better to just write the outputs and gather the states later
-# or is it better to store them directly int the kernel?
 # -------------------------------------
 # OPTIMAL CONFIG float32:
 # -------------------------------------
@@ -248,16 +246,19 @@ def ema_fwd_kernel(
     HAS_SEQ_IDX: tl.constexpr = False,
 ):
     """
-    SSD forward kernel in Triton with TMA loads.
+    EMA forward kernel in Triton with TMA loads.
     Each program instance handles one entire sequence for one (batch, head) pair.
 
-    Algorithm:
-    For each chunk sequentially:
-        1. Accumulate States += B[chunk]^T @ X[chunk]
-        2. Compute S = C[chunk] @ B[chunk]^T (with causal mask)
-        3. If dt present: multiply X by dt (element-wise)
-        4. If dA present: multiply S by exp2(segsum(dA))
-        5. Compute O[chunk] = C[chunk] @ States_prev + causal(S) @ X[chunk]
+    EMA-specific notes:
+      - headdim_bc = 1 and B, C are implicit ones, so the state is a single scalar per head.
+      - dA is log2 decay per token; exp2(dA) gives the decay multiplier.
+
+    Algorithm (per chunk, sequential):
+      1. Load X[chunk] and dA[chunk], compute cumulative decay:
+         dA_cs[t] = sum_{i<=t} dA[i],  dA_cs_sum = sum_{i in chunk} dA[i].
+      2. Compute per-position reverse decay: dA_cs_rev[t] = dA_cs_sum - dA_cs[t].
+      3. Output: out[t] = exp2(dA_cs_rev[t]) * state_prev + sum_{j<=t} exp2(dA_cs[j]-dA_cs[t]) * X[j].
+      4. Update state_prev for next chunk using the last position.
     """
     # Program ID: which head and batch
     pid_head = tl.program_id(0)
@@ -267,7 +268,6 @@ def ema_fwd_kernel(
     x_ptr = X + pid_batch * stride_x_batch + pid_head * stride_x_head
     o_ptr = Out + pid_batch * stride_o_batch + pid_head * stride_o_head
 
-    #TODO(kartiksrinivas): Recompute instead of load, remove head dim
     # NOTE: We do not need a head dimension for this load, since its same across heads
     # We can save on some ALU cycles
     da_ptr = DA + pid_batch * stride_da_batch + pid_head * stride_da_head
@@ -333,7 +333,6 @@ def ema_fwd_kernel(
         # Load dA for current chunk: (CHUNK_SIZE,)
         da_chunk = tl.load(da_ptr + offs_seqlen * stride_da_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
 
-        # TODO(kartiksrinivas): Do I do this before or after the seq_idx_chunk?
         dacs_chunk = tl.cumsum(da_chunk)
         dacs_last = tl.sum(da_chunk)
         dacsrev_chunk = dacs_last - dacs_chunk
@@ -344,22 +343,20 @@ def ema_fwd_kernel(
             seq_idx_chunk = tl.load(seq_idx_ptr + offs_seqlen * stride_seq_idx_seqlen, mask=seqlen_mask, other=-1)
             seq_idx_mask = seq_idx_chunk == prev_chunk_seq_idx
 
-        ##################################################################################################
-        # Compute Output using cumulative states
-        ##################################################################################################
+        # -----------------------------------------------------------------------------
+        # Compute output using cumulative states
+        # -----------------------------------------------------------------------------
 
-        #=================================
+        # ---------------------------------
         # Use new start state of chunk
         # multiply with per-position decay
-        # TODO(kartiksrinivas): Change to @aakash broadcast suggestion
-        #=================================
+        # ---------------------------------
   
-        #================================================
-        # Handle case with multiple sequences in the chunk
-        # Only the positions whose chunk id corresponds to 
-        # the final position of the prev chunk get the decay
-        #================================================
-        #TODO(kartiksrinivas): Look at the live range for scale, is this too much mem usage?
+        # ---------------------------------
+        # Handle case with multiple sequences in the chunk.
+        # Only positions whose chunk id corresponds to the final
+        # position of the prev chunk get the decay.
+        # ---------------------------------
         #NOTE: Handle case where sequence changes in chunk
         if HAS_SEQ_IDX:
             scale = tl.where(seq_idx_mask, tl.exp2(dacs_chunk), 0.0)
@@ -370,9 +367,9 @@ def ema_fwd_kernel(
         # (CHUNK_SIZE, BLOCK_HEADDIM_X)
         acc_o = acc_states * scale[:, None]
 
-        #=================================
+        # ---------------------------------
         # Add the present chunk contribution to output
-        #=================================
+        # ---------------------------------
         # (CHUNK_SIZE, CHUNK_SIZE)
         s_block = tl.exp2(segsum_triton(da_chunk, CHUNK_SIZE))
 
@@ -394,9 +391,9 @@ def ema_fwd_kernel(
             states_block = tl.reshape(acc_states, [1, 1, BLOCK_HEADDIM_X])
             states_desc.store([chunk_idx, 0, 0], states_block)
 
-        ##################################################################################################
+        # -----------------------------------------------------------------------------
         # Update cumulative states
-        ##################################################################################################
+        # -----------------------------------------------------------------------------
 
         # (CHUNK_SIZE, 1) -- This is the reverse (1 - p_2) 1 (last row per chunk)
         scale = tl.exp2(dacsrev_chunk).to(x_block.dtype)
@@ -437,33 +434,21 @@ def ema_fwd_triton(
     store_da_cs: bool = False,
     store_da_cs_sum: bool = False,
 ):
-    """Triton implementation of SSD forward pass with TMA
+    """Triton implementation of EMA forward pass with TMA.
 
     Args:
-        c: C tensor (b, s, h_bc, d)
-        b: B tensor (b, s, h_bc, d)
-        x: X tensor (b, s, h, dx)
-        dt: Optional delta/timestep tensor (b, h, s)
-        dA: Optional decay tensor (b, h, s)
-        dA_cs: Optional chunk cumsum of dA tensor (b, h, s)
-        dA_cs_rev: Optional reverse chunk cumsum of dA tensor (b, h, s)
-        z: Optional gating tensor (b, s, h, dx) - applies z * sigmoid(z) to output
+        x: Input tensor (b, s, h, dx)
+        dA: Log2 decay tensor (b, h, s), where exp2(dA) is the per-token decay
         out: Optional output tensor (b, s, h, dx)
-        c_bias: Optional bias tensor for c (h, d), here h_bc=h
-        b_bias: Optional bias tensor for b (h, d)
-        c_store: Optional tensor to store c with bias added (b, h, c, d)
-        b_store: Optional tensor to store b with bias added (b, h, c, d)
-        angles: Optional rotary embedding angles tensor (b, s, h, d//2)
-        trap: Optional trapping tensor (b, s, h)
-        chunk_size: Size of chunks for processing (64 or 128)
-        store_states: If True, store and return accumulated states tensor
+        seq_idx: Optional sequence id tensor for stitched sequences (b, s)
+        chunk_size: Chunk size (64 or 128)
+        store_states: Store per-chunk end states (b, num_chunks, h, 1, dx)
+        store_da_cs: Store per-token cumulative dA in chunk (b, h, s)
+        store_da_cs_sum: Store per-chunk sum of dA (b, h, num_chunks)
 
     Returns:
-        If store_states=True: tuple of (out, states)
-        If store_states=False: out only
-        where:
-            out: Output tensor (b, s, h, dx)
-            states: Accumulated states tensor (b, num_chunks, h, d, dx)
+        out only, or (out, states), or (out, da_cs), or (out, da_cs_sum),
+        or (out, states, da_cs_sum) depending on storage flags.
     """
     assert chunk_size in [64, 128]
     assert dA is not None 
@@ -493,9 +478,7 @@ def ema_fwd_triton(
         da_cs_sum = None
 
     # Round up head dims to multiples of 16 for efficient loading
-    # TODO(kartiksrinivas): There should be no blocking over headdim_bc since it is 1
     # BLOCK_HEADDIM_BC = triton.next_power_of_2(headdim_bc) # interesting, there cannot be blocking over this one
-    #TODO(kartiksrinivas): The whole thing is being loaded?
     BLOCK_HEADDIM_X = triton.next_power_of_2(headdim_x) 
 
     # Grid: each program handles one (head, batch) pair and processes all chunks sequentially
@@ -669,15 +652,11 @@ def test_ema(
     device="cuda",
 ):
     assert nheads % nheads_bc == 0
-    # TODO(kartiksrinivas): how is this chunk size chosen and why?
     chunk_size_triton = 64 
 
     # Create input tensors
     X = torch.randn(batch, seqlen, nheads, headdim_x, dtype=dtype, device=device)
     O = torch.zeros_like(X, dtype=dtype, device=device)
-    #TODO(kartiksrinivas): You can repeat this for every head  -- do we need to do that though?
-    #TODO(kartiksrinivas): This is more memory consumption (but it makes things parallel)
-    #TODO(kartiksrinivas): Maybe can we use a TMA multicast to load the same value across multiple heads (programs?)
     P = torch.rand(batch, seqlen, 1, dtype=dtype, device=device) 
     P_mamba = einops.repeat(P, 'b s 1 -> b s h', h=nheads)  
     P_mamba = einops.rearrange(P_mamba , 'b s h -> b h s')
@@ -686,7 +665,7 @@ def test_ema(
     dA = torch.log(1 - P_mamba) * math.log2(math.e)
     
 
-    # Test Triton implementation``
+    # Test Triton implementation
     print("\n=== Testing Triton Implementation ===")
     out_triton, da_cs, da_cs_sum = ema_fwd_triton(
         X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False, store_da_cs=True, store_da_cs_sum=True
@@ -699,9 +678,9 @@ def test_ema(
     print(f"Triton vs Ref f32, max diff = {(out_triton - out_ref).abs().max().item():.6f}, mean diff = {(out_triton - out_ref).abs().mean().item():.6f}")
 
 
-    #############################################
-    # BENCHMARKING 
-    ############################################
+    # ---------------------------------------------
+    # BENCHMARKING
+    # ---------------------------------------------
 
     from triton.testing import do_bench, do_bench_cudagraph
     import time
@@ -728,7 +707,6 @@ def test_ema(
 
     # Calculate memory I/O with states
     # States: (batch, num_chunks, nheads, headdim_bc, headdim_x) in float32 (4 bytes)
-    # States: (batch, num_chunks, nheads, headdim_bc, headdim_x) in float32 (4 bytes)
     num_states_elements = batch * num_chunks * nheads * headdim_bc * headdim_x
     num_bytes_states = num_states_elements * 4  # float32
     num_io_with_states = num_io + num_bytes_states
@@ -751,7 +729,6 @@ def test_ema(
 
     # Benchmark Triton (without states)
     torch.cuda.synchronize()
-    #TODO(kartiksrinivas): Why is this sleep needed?
     time.sleep(1.0)
     fn = lambda: ema_fwd_triton(
         X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False, store_da_cs_sum=True
@@ -792,15 +769,11 @@ def test_ema_seqidx(
 ):
     assert nheads % nheads_bc == 0
     assert seqlen % K == 0, "seqlen must be multiple of 4 for this test"
-    # TODO(kartiksrinivas): how is this chunk size chosen and why?
     chunk_size_triton = 64 
 
     # Create input tensors
     X = torch.randn(batch, seqlen, nheads, headdim_x, dtype=dtype, device=device)
     O = torch.zeros_like(X, dtype=dtype, device=device)
-    #TODO(kartiksrinivas): You can repeat this for every head  -- do we need to do that though?
-    #TODO(kartiksrinivas): This is more memory consumption (but it makes things parallel)
-    #TODO(kartiksrinivas): Maybe can we use a TMA multicast to load the same value across multiple heads (programs?)
     P = torch.rand(batch, seqlen, 1, dtype=dtype, device=device) 
 
     # Build a K-fold arangement of sequences of even length
@@ -841,9 +814,9 @@ def test_ema_seqidx(
 
 
 
-    #############################################
-    # BENCHMARKING 
-    ############################################
+    # ---------------------------------------------
+    # BENCHMARKING
+    # ---------------------------------------------
 
     from triton.testing import do_bench, do_bench_cudagraph
     import time
@@ -884,7 +857,6 @@ def test_ema_seqidx(
 
     # Benchmark Triton (without states)
     torch.cuda.synchronize()
-    #TODO(kartiksrinivas): Why is this sleep needed?
     time.sleep(1.0)
     fn = lambda: ema_fwd_triton(
         X, dA=dA, out=None, chunk_size=chunk_size_triton, store_states=False, store_da_cs_sum=True

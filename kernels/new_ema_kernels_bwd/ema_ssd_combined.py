@@ -43,8 +43,8 @@ def _da_cs_sum(da_cs: torch.Tensor, chunk_size: int) -> torch.Tensor:
     return torch.gather(da_cs, dim=-1, index=gather_idx)
 
 
-#TODO(kartiksrinivas): is the da, da_cs_sum needed, or can we compute them on the fly instead,
-# This might improve the speed provided it does not cause too many local spills
+# da_cs and da_cs_sum are currently materialized to keep kernel math simple
+# and avoid register pressure from recomputation.
 def compute_dpx(
     x: torch.Tensor,
     da_cs: torch.Tensor,
@@ -57,30 +57,24 @@ def compute_dpx(
     has_input_state: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
-    Compute gradients dQ_mid, dK_mid, dV, dADT, dQK_dot, dD, d_issm_state for Mamba-3 backward pass.
-    
-    This kernel operates on the rotated/scaled Q and K tensors (Q_mid, K_mid from forward).
-    
+    EMA backward wrapper that launches the Triton kernel for dX and dA.
+
     Args:
-        q: Rotated query tensor Q_mid (batch, seqlen, headdim_qk, headdim_qk)
-        k: Rotated+scaled key tensor K_mid (batch, seqlen, headdim_qk, headdim_qk)
-        v: Value tensor (batch, seqlen, nheads, headdim_v)
-        da_cs: Cumulative decay per chunk (batch, nheads, seqlen)
-        da_cs_sum: Sum of decay per chunk (batch, nheads, nchunks)
-        qk_dot: QK dot products from forward (batch, nheads, seqlen)
-        SSM_States: SSM states from forward pass (batch, nheads, headdim_v, nchunks * headdim_qk)
-        do: Output gradient, possibly scaled by Z (batch, seqlen, nheads, headdim_v)
-        d_ossm_state: Gradient of output SSM states (batch, nheads, headdim_v, headdim_qk)
-        d_ov_state: Gradient of output V state (batch, nheads, headdim_v) - added to last token of dV
-        D: Optional skip connection weight (nheads,)
+        x: Input tensor (batch, seqlen, nheads, head_dim)
+        da_cs: Per-token cumulative dA within each chunk (batch, nheads, seqlen)
+        da_cs_sum: Per-chunk sum of dA (batch, nheads, nchunks)
+        SSM_States: Per-chunk start states from forward (batch, nheads, head_dim, nchunks)
+        do: Output gradient (batch, seqlen, nheads, head_dim)
+        d_ossm_state: Optional gradient of output state (batch, nheads, head_dim)
+        d_ox_state: Optional gradient added to last token (batch, nheads, head_dim)
         chunk_size: Chunk size (default: 64)
-        has_input_state: Whether to compute gradient for input states
-    
+        has_input_state: Whether to return gradient for input states
+
     Returns:
-        Tuple of (dx, dA, d_issm_state) where d_issm_state is None if has_input_state=False
+        (dx, dA, d_issm_state) where d_issm_state is None if has_input_state=False.
     """
+    # Shapes and derived sizes
     batch, seqlen, nheads, head_dim = x.shape
-    num_sequences = batch
     # NOTE(kartiksrinivas): Does choosing a single head make this far easier?
     nheads_qk = nheads # same number of heads for now
 
@@ -97,7 +91,7 @@ def compute_dpx(
     assert d_ox_state is None or d_ox_state.shape == (batch, nheads, head_dim)
     
     # Ensure all tensors are contiguous for optimal memory access
-    # Check if tensors have expected strides (innermost dimension stride = 1)
+    # (innermost dimension stride = 1)
     if x.stride(-1) != 1:
         x = x.contiguous()
     if da_cs.stride(-1) != 1:
@@ -113,6 +107,7 @@ def compute_dpx(
     if d_ox_state is not None and d_ox_state.stride(-1) != 1:
         d_ox_state = d_ox_state.contiguous()
     
+    # Ensure allocator is set for TMA scratch
     _set_triton_allocator()
 
     # Allocate output tensors
@@ -125,12 +120,10 @@ def compute_dpx(
     )  # custom input states
     
     # Round up head dimensions to power of 2 for efficient loading
-    # HEADDIM_QK = triton.next_power_of_2(headdim_qk) # 1 since next_pwoer_of_2(1) = 1
-
     HEAD_DIM = triton.next_power_of_2(head_dim)
 
     
-    # Grid: each program handles one (head, batch/num_sequences) pair
+    # Grid: each program handles one (head, batch) pair
     grid = (nheads, batch)
     
     # Launch kernel
@@ -191,6 +184,7 @@ class _EmaFunction(torch.autograd.Function):
         if A.shape != (batch, seqlen):
             raise ValueError(f"A must be (batch, seqlen), got {A.shape}")
 
+        # Convert to log2 decay and expand across heads
         dA = (A * math.log2(math.e)).to(torch.float32)
         dA = dA[:, None, :].repeat(1, nheads, 1).contiguous()
         out, states, da_cs, da_cs_sum = ema_fwd_triton(
@@ -202,7 +196,7 @@ class _EmaFunction(torch.autograd.Function):
             store_da_cs=True,
             store_da_cs_sum=True,
         )
-        # Forward now stores start-state per chunk.
+        # Forward stores start-state per chunk.
         ssm_states_shifted = states.squeeze(3).permute(0, 2, 3, 1).contiguous()
 
         ctx.chunk_size = chunk_size
@@ -215,6 +209,7 @@ class _EmaFunction(torch.autograd.Function):
             return None, None, None
 
         x, da_cs, da_cs_sum, ssm_states = ctx.saved_tensors
+        # Backward: compute gradients w.r.t. X and dA (log2 space)
         dx, dA, _ = compute_dpx(
             x,
             da_cs,
