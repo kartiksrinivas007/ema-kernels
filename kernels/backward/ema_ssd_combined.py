@@ -1,10 +1,10 @@
-"""Ema Triton Autograd Wrapper
+"""EMA SSD Autograd Wrapper (Triton).
 
-Interface for EMA kernels with automatic differentiation
-
-Copyright (c) 2025,  Goombalab
-
-Author: Kartik Srinivas
+Copyright (c) 2026, Goomba Lab
+Authors:
+- Kartik Srinivas <kartiksr@cs.cmu.edu>
+- Aakash Lahoti <alahoti@andrew.cmu.edu>
+- Sukjun Hwang <sukjunh@andrew.cmu.edu>
 """
 
 from typing import Optional, Tuple

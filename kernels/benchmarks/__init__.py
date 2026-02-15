@@ -1,4 +1,4 @@
-"""EMA SSD Kernels Package.
+"""EMA SSD Benchmarks Package.
 
 Copyright (c) 2026, Goomba Lab
 Authors:

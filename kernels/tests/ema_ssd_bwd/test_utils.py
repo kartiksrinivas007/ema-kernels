@@ -1,3 +1,9 @@
+"""EMA SSD Test Utilities.
+
+Copyright (c) 2026, Goomba Lab
+Co-authors: Aakash Lahoti <alahoti@andrew.cmu.edu>, Sukjun Hwang <sukjunh@andrew.cmu.edu>
+"""
+
 import torch
 
 

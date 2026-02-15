@@ -1,6 +1,14 @@
-# Copyright (c) 2025, Tri Dao.
-# Baseline: nheads_bc=1 = 0.4 ms/ 
-# Baseline: nheads_bc=32 = 0.514 ms/ 
+"""EMA SSD Forward Kernel (Triton).
+
+Copyright (c) 2026, Goomba Lab
+Authors:
+- Kartik Srinivas <kartiksr@cs.cmu.edu>
+- Aakash Lahoti <alahoti@andrew.cmu.edu>
+- Sukjun Hwang <sukjunh@andrew.cmu.edu>
+"""
+
+# Baseline: nheads_bc=1 = 0.4 ms/
+# Baseline: nheads_bc=32 = 0.514 ms/
 # This kernel: 0.89 ms
 
 from typing import Optional
