@@ -13,6 +13,7 @@ import math
 
 import torch
 import triton
+import triton.runtime._allocation as _triton_alloc
 
 from kernels.new_ema_kernels.ema_ssd_fwd import chunk_cumsum_triton, ema_fwd_triton
 from kernels.new_ema_kernels_bwd.ema_ssd_bwd import ema_ssd_bwd_kernel_dpx
@@ -21,11 +22,15 @@ from kernels.new_ema_kernels_bwd.ema_ssd_bwd import ema_ssd_bwd_kernel_dpx
 def alloc_fn(size: int, alignment: int, stream: Optional[int]):
     return torch.empty(size, device="cuda", dtype=torch.int8)
 
-
-try:
+def _set_triton_allocator():
     triton.set_allocator(alloc_fn)
-except Exception:
-    pass
+    if hasattr(_triton_alloc, "set_allocator"):
+        _triton_alloc.set_allocator(alloc_fn)
+    else:
+        _triton_alloc._allocator = alloc_fn
+
+
+_set_triton_allocator()
 
 
 def _da_cs_sum(da_cs: torch.Tensor, chunk_size: int) -> torch.Tensor:
@@ -108,6 +113,8 @@ def compute_dpx(
     if d_ox_state is not None and d_ox_state.stride(-1) != 1:
         d_ox_state = d_ox_state.contiguous()
     
+    _set_triton_allocator()
+
     # Allocate output tensors
     dx = torch.empty_like(x)
     dA = torch.empty_like(da_cs) # is this usually float32?

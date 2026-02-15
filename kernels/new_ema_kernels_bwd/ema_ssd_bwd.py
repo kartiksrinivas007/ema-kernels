@@ -3,25 +3,17 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+import triton.runtime._allocation as _triton_alloc
 
 
 def alloc_fn(size: int, alignment: int, stream: Optional[int]):
     return torch.empty(size, device="cuda", dtype=torch.int8)
 
-
-try:
-    triton.set_allocator(alloc_fn)
-except Exception:
-    pass
-
-# Out, Out_v, SSM_States, DA_CS, DA_CS_SUM, Q_rot, K_scaled, QK_dot, Scale, SGamma, Output_States = mamba3_fwd(
-#     Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, D, Z, Input_States,
-#     chunk_size=chunk_size,
-#     store_states_adt_outv=needs_backward,
-#     return_output_state=return_output_state,
-#     Cu_Seqlen=Cu_Seqlen,
-# )
-
+triton.set_allocator(alloc_fn)
+if hasattr(_triton_alloc, "set_allocator"):
+    _triton_alloc.set_allocator(alloc_fn)
+else:
+    _triton_alloc._allocator = alloc_fn
 
 # =============================================================================
 # dQKV Kernel
@@ -29,10 +21,11 @@ except Exception:
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_stages=s, num_warps=w)
+        triton.Config({}, num_warps=2, num_stages=2, num_ctas=1)
+        # Search sweep (disabled):
+        # triton.Config({}, num_stages=s, num_warps=w)
         # for s in [1, 2, 3]
-        for s in [1, 2, 3]
-        for w in [2, 4, 8]
+        # for w in [2, 4, 8]
     ],
     key=["CHUNK_SIZE", "HEAD_DIM"]
 )
@@ -414,15 +407,8 @@ def ema_ssd_bwd_kernel_dpx(
         d_ssm_states_acc = (tl.math.exp2(da_cs_chunk_sum) * d_ssm_states_acc +
                        tl.sum(tl.trans(dO_reloaded), axis = 1, keep_dims=True))
 
-    # # Store Final dD Gradient 
-    # if D is not None:
-    #     tl.store(dD + dD_offset + tl.arange(0, 1), dD_acc)
+
 
     # Store d_ISSM_State 
     if RETURN_D_ISSM_STATE:
         tl.store(d_ISSM_State + d_issm_state_offset + tl.arange(0, HEAD_DIM)[:, None] * stride_d_issm_state_head_dim + tl.arange(0, 1)[None, :] * stride_d_issm_state_dstate, d_ssm_states_acc)
-    # if RETURN_D_ISSM_STATE:
-    #     tl.store(
-    #         d_ISSM_State + d_issm_state_offset + tl.arange(0, HEAD_DIM) * stride_d_issm_state_head_dim,
-    #         d_ssm_states_acc[:, 0],
-    #     )
