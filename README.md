@@ -2,7 +2,7 @@
 
 Forward (ema_fwd_triton) correctness and speed:
 ```bash
-python -m pytest -v -s kernels/tests/ema_ssd_bwd/test_ema_dpx.py
+python kernels/forward/ema_ssd_fwd.py
 ```
 
 Backward (compute_dpx) correctness + speed (bench runs inside):
