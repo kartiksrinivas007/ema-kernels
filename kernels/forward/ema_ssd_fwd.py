@@ -146,8 +146,7 @@ def chunk_cumsum_kernel(
     # Exclusive cumsum, so shifted by 1 and 0th element is 0
     dacs_ptr = dA_cs + pid_batch * stride_dacs_batch + pid_head * stride_dacs_head
     tl.store(dacs_ptr + offs_seqlen * stride_dacs_seqlen, da_cs_chunk, mask=mask)
-    # tl.store(dacs_ptr + 1 + offs_seqlen * stride_dacs_seqlen, da_cs_chunk, mask=tl.arange(0, CHUNK_SIZE) < min(seqlen - 1 - chunk_start, CHUNK_SIZE - 1))
-    # tl.store(dacs_ptr + chunk_start, 0.0)
+
     # Compute and store exclusive reverse cumsum
     da_cs_rev_chunk = tl.cumsum(da_chunk, axis=0, reverse=True)
     if EXP2:
@@ -213,7 +212,7 @@ def chunk_cumsum_triton(
     return dA_cs, dA_cs_rev
 
 # -------------------------------------
-# OPTIMAL CONFIG float32:
+# Autotuning Search parameters:-
 # -------------------------------------
 # best config selected: num_warps: 2, num_ctas: 1, num_stages: 2, maxnreg: 256;
 # @triton.autotune(
@@ -246,7 +245,6 @@ def ema_fwd_kernel(
     stride_seq_idx_batch, stride_seq_idx_seqlen,
     seqlen, headdim_bc, headdim_x, nheads_bc, batch, nheads,
     CHUNK_SIZE: tl.constexpr,
-    # BLOCK_HEADDIM_BC: tl.constexpr,
     BLOCK_HEADDIM_X: tl.constexpr,
     STORE_STATES: tl.constexpr,
     STORE_DA_CS: tl.constexpr,
@@ -257,27 +255,15 @@ def ema_fwd_kernel(
     EMA forward kernel in Triton with TMA loads.
     Each program instance handles one entire sequence for one (batch, head) pair.
 
-    EMA-specific notes:
-      - headdim_bc = 1 and B, C are implicit ones, so the state is a single scalar per head.
-      - dA is log2 decay per token; exp2(dA) gives the decay multiplier.
-
-    Algorithm (per chunk, sequential):
-      1. Load X[chunk] and dA[chunk], compute cumulative decay:
-         dA_cs[t] = sum_{i<=t} dA[i],  dA_cs_sum = sum_{i in chunk} dA[i].
-      2. Compute per-position reverse decay: dA_cs_rev[t] = dA_cs_sum - dA_cs[t].
-      3. Output: out[t] = exp2(dA_cs_rev[t]) * state_prev + sum_{j<=t} exp2(dA_cs[j]-dA_cs[t]) * X[j].
-      4. Update state_prev for next chunk using the last position.
+    This implements the recursion 
+        Z[t] = exp2(dA[t]) * Z[t - 1] + X[t]
     """
     # Program ID: which head and batch
     pid_head = tl.program_id(0)
     pid_batch = tl.program_id(1)
 
-    # Compute head index for C/B (for GQA support)
     x_ptr = X + pid_batch * stride_x_batch + pid_head * stride_x_head
     o_ptr = Out + pid_batch * stride_o_batch + pid_head * stride_o_head
-
-    # NOTE: We do not need a head dimension for this load, since its same across heads
-    # We can save on some ALU cycles
     da_ptr = DA + pid_batch * stride_da_batch + pid_head * stride_da_head
 
 
@@ -288,7 +274,6 @@ def ema_fwd_kernel(
 
     # Create TMA descriptors for 2D tensors (seqlen, headdim)
     # We load 2D blocks of shape (CHUNK_SIZE, headdim)
-
     x_desc = tl.make_tensor_descriptor(
         x_ptr,
         shape=[seqlen, headdim_x],
@@ -324,26 +309,26 @@ def ema_fwd_kernel(
     # Register analysis [RA]: 128*64/128 = 64 regs/thread; live = 64
     acc_states = tl.zeros([1, BLOCK_HEADDIM_X], dtype=tl.float32)
 
-    # tl.debug_barrier()
-
     prev_chunk_seq_idx = tl.full((), 0, tl.int8) # stores the id of the previous chunk (register) 
-
 
     for chunk_idx in range(num_chunks):
         chunk_start = chunk_idx * CHUNK_SIZE
         offs_seqlen = chunk_start + tl.arange(0, CHUNK_SIZE)
 
         x_block = x_desc.load([chunk_start, 0])
+
         seqlen_mask = offs_seqlen < seqlen
-        
 
-
-        # Load dA for current chunk: (CHUNK_SIZE,)
+        # ============================================================
+        # PART 1: Load decay for this chunk and compute cumsums
+        # ============================================================
+        # (CHUNK_SIZE,)
         da_chunk = tl.load(da_ptr + offs_seqlen * stride_da_seqlen, mask=seqlen_mask, other=0.0).to(tl.float32)
 
         dacs_chunk = tl.cumsum(da_chunk)
         dacs_last = tl.sum(da_chunk)
         dacsrev_chunk = dacs_last - dacs_chunk
+
         if STORE_DA_CS:
             tl.store(da_cs_ptr + offs_seqlen * stride_da_cs_seqlen, dacs_chunk, mask=seqlen_mask)
 
@@ -351,59 +336,52 @@ def ema_fwd_kernel(
             seq_idx_chunk = tl.load(seq_idx_ptr + offs_seqlen * stride_seq_idx_seqlen, mask=seqlen_mask, other=-1)
             seq_idx_mask = seq_idx_chunk == prev_chunk_seq_idx
 
-        # -----------------------------------------------------------------------------
-        # Compute output using cumulative states
-        # -----------------------------------------------------------------------------
-
-        # ---------------------------------
-        # Use new start state of chunk
-        # multiply with per-position decay
-        # ---------------------------------
+        # ============================================================
+        # PART 2: Compute decay for the chunk start state
+        # ============================================================
   
-        # ---------------------------------
-        # Handle case with multiple sequences in the chunk.
-        # Only positions whose chunk id corresponds to the final
-        # position of the prev chunk get the decay.
-        # ---------------------------------
-        #NOTE: Handle case where sequence changes in chunk
         if HAS_SEQ_IDX:
+            # ---------------------------------
+            # Handle case with multiple sequences in the chunk.
+            # Only positions whose chunk id corresponds to the final
+            # position of the prev chunk get the decay.
+            # ---------------------------------
             scale = tl.where(seq_idx_mask, tl.exp2(dacs_chunk), 0.0)
-            # scale = tl.where(seq_idx_chunk == prev_chunk_seq_idx, tl.exp2(dacs_chunk), 0.0)
         else:
             scale = tl.exp2(dacs_chunk)
 
         # (CHUNK_SIZE, BLOCK_HEADDIM_X)
         acc_o = acc_states * scale[:, None]
 
-        # ---------------------------------
-        # Add the present chunk contribution to output
-        # ---------------------------------
+
+        # ============================================================
+        # PART 3: Compute within-chunk EMA updates
+        # ============================================================
         # (CHUNK_SIZE, CHUNK_SIZE)
         s_block = tl.exp2(segsum_triton(da_chunk, CHUNK_SIZE))
 
         # NOTE: multiply this by a (CHUNK_SIZE, CHUNK_SIZE) seqid mask
         if HAS_SEQ_IDX:
             s_block = tl.where(seq_idx_chunk[:, None] == seq_idx_chunk[None, :], s_block, 0.0)
-        # O += causal(S) @ X: (CHUNK_SIZE, CHUNK_SIZE) @ (CHUNK_SIZE, headdim_x)
+        
+        # (CHUNK_SIZE, CHUNK_SIZE) @ (CHUNK_SIZE, headdim_x)
         acc_o += tl.dot(s_block.to(x_block.dtype), x_block)
 
-
+        
         # Store output block
         o_desc.store([chunk_start, 0], acc_o.to(x_block.dtype))
 
-
-        # Optionally store accumulated states to global memory using TMA
+        
+        # ============================================================
+        # PART 4: Store per-chunk start state and update for next chunk
+        # ============================================================
         # Store the start-state of the chunk (before update).
         if STORE_STATES:
             # States shape: (batch, num_chunks, nheads, headdim_bc=1, headdim_x)
             states_block = tl.reshape(acc_states, [1, 1, BLOCK_HEADDIM_X])
             states_desc.store([chunk_idx, 0, 0], states_block)
 
-        # -----------------------------------------------------------------------------
         # Update cumulative states
-        # -----------------------------------------------------------------------------
-
-        # (CHUNK_SIZE, 1) -- This is the reverse (1 - p_2) 1 (last row per chunk)
         scale = tl.exp2(dacsrev_chunk).to(x_block.dtype)
 
         if HAS_SEQ_IDX:
@@ -464,6 +442,7 @@ def ema_fwd_triton(
     assert dA.is_cuda, "dA tensor must be on CUDA"
 
     batch, seqlen, nheads, headdim_x = x.shape
+
     # d_state is 1 since this is an EMA
     headdim_bc = 1
     num_chunks = triton.cdiv(seqlen, chunk_size)
@@ -486,7 +465,6 @@ def ema_fwd_triton(
         da_cs_sum = None
 
     # Round up head dims to multiples of 16 for efficient loading
-    # BLOCK_HEADDIM_BC = triton.next_power_of_2(headdim_bc) # interesting, there cannot be blocking over this one
     BLOCK_HEADDIM_X = triton.next_power_of_2(headdim_x) 
 
     # Grid: each program handles one (head, batch) pair and processes all chunks sequentially

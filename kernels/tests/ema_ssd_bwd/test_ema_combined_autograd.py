@@ -55,6 +55,8 @@ def test_ema_combined_autograd():
     # Reference
     A_ref = A.detach().clone().requires_grad_()
     X_ref = X.detach().clone().requires_grad_()
+
+    # Equivalently, A  = torch.log(1 - P)
     P = 1 - torch.exp(A_ref)
     out_ref = ema_loop(X_ref.reshape(batch, seqlen, nheads * headdim), P)
     loss_ref = (out_ref * dout.reshape(batch, seqlen, nheads * headdim)).sum()

@@ -81,10 +81,8 @@ def compute_dpx(
     nchunks = (seqlen + chunk_size - 1) // chunk_size
     assert x.is_cuda and da_cs.is_cuda and da_cs_sum.is_cuda and do.is_cuda, "All tensors must be on CUDA"
 
-    #TODO(kartiksrinivas): These are being provided and not computed (possibly to avoid spills?)
     assert da_cs.shape == (batch, nheads, seqlen) # nchunks * chunk_size
     assert da_cs_sum.shape == (batch, nheads, nchunks) # only the factors themselves
-    #TODO(kartiksrinivas): How does changing this arrangement change the performance
     assert SSM_States.shape == (batch, nheads, head_dim, nchunks)  # dstate is 1, head_dim sized tensor
     assert do.shape == (batch, seqlen, nheads, head_dim)
     assert d_ossm_state is None or d_ossm_state.shape == (batch, nheads, head_dim)

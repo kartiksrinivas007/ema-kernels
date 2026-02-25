@@ -41,25 +41,24 @@ def ema_ssd_bwd_kernel_dpx(
     X, DA_CS, DA_CS_SUM, SSM_States, dO, d_OSSM_State, # dO is scaled with Z
     # Output tensors
     dX, dA, d_ISSM_State, # dQK_Dot is scaled with scale
-    # Strides for V: (batch, seqlen, nheads, HEADDIM_V)
+    # Strides for X: (batch, seqlen, nheads, head_dim)
     stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_head_dim,
     # Strides for DA_CS: (batch, nheads, seqlen)
     stride_da_cs_batch, stride_da_cs_head, stride_da_cs_seqlen,
     # Strides for DA_CS_SUM: (batch, nheads, nchunks)
     stride_da_cs_sum_batch, stride_da_cs_sum_head, stride_da_cs_sum_chunk,
-    # Strides for SSM_States: (batch, nheads, HEADDIM_V, nchunks) 
-    # NOTE(kartiksrinivas): squeezed numchunks, possibly done for optimized access (fastest moving dimension, is serially stored)
+    # Strides for SSM_States: (batch, nheads, head_dim, nchunks)
     stride_ssm_states_batch, stride_ssm_states_head, stride_ssm_states_head_dim, stride_ssm_states_chunk,
-    # Strides for dO: (batch, seqlen, nheads, HEADDIM_V)
+    # Strides for dO: (batch, seqlen, nheads, head_dim)
     stride_do_batch, stride_do_seqlen, stride_do_head, stride_do_head_dim,
-    # Strides for d_OSSM_State: (batch, nheads, HEADDIM_V)
+    # Strides for d_OSSM_State: (batch, nheads, head_dim)
     stride_d_ossm_state_batch, stride_d_ossm_state_head, stride_d_ossm_state_head_dim,
     # Strides for Outputs
-    # Strides for dX: (batch, seqlen, nheads, HEADDIM_V)
+    # Strides for dX: (batch, seqlen, nheads, head_dim)
     stride_dx_batch, stride_dx_seqlen, stride_dx_head, stride_dx_head_dim,
     # Strides for dA: (batch, nheads, seqlen)
     stride_da_batch, stride_da_head, stride_da_seqlen,
-    # Strides for d_ISSM_State: (batch, nheads, HEADDIM_V, 1)
+    # Strides for d_ISSM_State: (batch, nheads, head_dim, 1)
     stride_d_issm_state_batch, stride_d_issm_state_head, stride_d_issm_state_head_dim, stride_d_issm_state_dstate,
     # Dimensions
     seqlen, nheads_qk, # = nheads_bc = nheads for EMA
@@ -169,8 +168,8 @@ def ema_ssd_bwd_kernel_dpx(
         # ------------------------------------------------------------
         # Load X and dO via TMA
         # ------------------------------------------------------------
-        do_block = do_desc.load([chunk_start, 0])  # (CHUNK_SIZE, HEADDIM_V)
-        x_block = x_desc.load([chunk_start, 0])    # (CHUNK_SIZE, HEADDIM_V)
+        do_block = do_desc.load([chunk_start, 0])  # (CHUNK_SIZE, head_dim)
+        x_block = x_desc.load([chunk_start, 0])    # (CHUNK_SIZE, head_dim)
 
         # ------------------------------------------------------------
         # Compute decay scaling factors
@@ -219,13 +218,13 @@ def ema_ssd_bwd_kernel_dpx(
         else:
             p_t_block = causal_decay_mask
 
-        acc_dx = tl.dot(p_t_block.to(do_block.dtype), do_block)  # (CHUNK_SIZE, HEADDIM_V)
+        acc_dx = tl.dot(p_t_block.to(do_block.dtype), do_block)  # (CHUNK_SIZE, head_dim)
 
         # NOTE(kartiksrinivas): K is all ones, this is an outerproduct
         # Inter-chunk: gradient through states
-        # (CHUNK_SIZE, 1 ) @ (1, HEADDIM_V) @  = (CHUNK_SIZE, HEADDIM_V)
+        # (CHUNK_SIZE, 1 ) @ (1, head_dim) @  = (CHUNK_SIZE, head_dim)
         # acc_dx += tl.dot(k_block, tl.trans(d_ssm_states_acc).to(k_block.dtype)) * exp_da_cs_rev[:, None]
-        # (CHUNK_SIZE, HEADDIM_V) += (CHUNK_SIZE, 1) * (1, HEADDIM_V)
+        # (CHUNK_SIZE, head_dim) += (CHUNK_SIZE, 1) * (1, head_dim)
         acc_dx += tl.trans(d_ssm_states_acc).to(acc_dx.dtype) * exp_da_cs_rev[:, None]
 
         # Load dO again with volatile to avoid cache conflicts
@@ -248,7 +247,7 @@ def ema_ssd_bwd_kernel_dpx(
         # ------------------------------------------------------------
         # Gradient from Q @ States^T term
         # NOTE(kartiksrinivas): This is not needed, this is an outerproduct
-        # QS = tl.dot(q_block, tl.trans(ssm_states_block))  # (CHUNK_SIZE, HEADDIM_V)
+        # QS = tl.dot(q_block, tl.trans(ssm_states_block))  # (CHUNK_SIZE, head_dim)
         # dM_rev_vector += tl.sum(QS * dO_reloaded, axis=1) * exp_da_cs  # (CHUNK_SIZE,)
         dM_rev_vector += tl.sum(tl.trans(ssm_states_block) * dO_reloaded, axis=1) * exp_da_cs  # (CHUNK_SIZE,)
 
@@ -259,13 +258,13 @@ def ema_ssd_bwd_kernel_dpx(
         SSM_States_ptrs = (SSM_States + ssm_states_offset +
                 tl.arange(0, HEAD_DIM)[:, None] * stride_ssm_states_head_dim +
                 (chunk_idx + tl.arange(0, 1)[None, :]) * stride_ssm_states_chunk)
-        SSM_States_reloaded = tl.load(SSM_States_ptrs, volatile=True)  # (HEADDIM_V, 1)
+        SSM_States_reloaded = tl.load(SSM_States_ptrs, volatile=True)  # (head_dim, 1)
         dM_scalar = tl.sum(SSM_States_reloaded * d_ssm_states_acc) * tl.math.exp2(da_cs_chunk_sum)
 
         # ------------------------------------------------------------
         # dA gradient (part 4): from dStates
         # ------------------------------------------------------------
-        # dSK = tl.dot(k_block, tl.trans(d_ssm_states_acc).to(k_block.dtype))  # (CHUNK_SIZE, HEADDIM_V)
+        # dSK = tl.dot(k_block, tl.trans(d_ssm_states_acc).to(k_block.dtype))  # (CHUNK_SIZE, head_dim)
         # dM_vector = tl.sum(dSK * v_block_reloaded, axis=1) * exp_da_cs_rev  # (CHUNK_SIZE,)
         dM_vector = tl.sum(tl.trans(d_ssm_states_acc).to(x_block_reloaded.dtype) * x_block_reloaded, axis=1) * exp_da_cs_rev  # (CHUNK_SIZE,)
 
