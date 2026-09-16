@@ -1,5 +1,7 @@
 # Triton EMA SSD Kernels
 
+To be tested on H100
+
 Forward (ema_fwd_triton) correctness and speed:
 ```bash
 python kernels/forward/ema_ssd_fwd.py
